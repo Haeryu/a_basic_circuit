@@ -7,12 +7,24 @@ const BusIndex = CompiledCircuit.BusIndex;
 const ChipSpec = CompiledCircuit.ChipSpec;
 const Topology = CompiledCircuit.Topology;
 
+const ChipIndex = CompiledCircuit.ChipIndex;
+
+const ReverseEntry = packed struct(u64) {
+    generation: u31 = 0,
+    valid: bool = false,
+    runtime_index: u32 = 0,
+};
+
 pub const Compilation = struct {
     topology: Topology,
 
     // Runtime index -> editor handle.
     bus_to_net: []Circuit.NetId,
     chip_to_node: []Circuit.NodeId,
+
+    // Editor sparse slot -> runtime index.
+    net_to_bus: []ReverseEntry,
+    node_to_chip: []ReverseEntry,
 
     topology_owned: bool = true,
 
@@ -21,16 +33,68 @@ pub const Compilation = struct {
             self.topology.deinit(allocator);
         }
 
-        allocator.free(self.bus_to_net);
+        allocator.free(self.node_to_chip);
+        allocator.free(self.net_to_bus);
+
         allocator.free(self.chip_to_node);
+        allocator.free(self.bus_to_net);
 
         self.* = undefined;
+    }
+
+    pub fn busForNet(self: *const Compilation, net_id: Circuit.NetId) ?BusIndex {
+        if (net_id.reserved != 0) {
+            return null;
+        }
+
+        const slot: usize = @intCast(net_id.index);
+
+        if (slot >= self.net_to_bus.len) {
+            return null;
+        }
+
+        const entry = self.net_to_bus[slot];
+
+        if (!entry.valid) {
+            return null;
+        }
+
+        if (entry.generation != net_id.generation) {
+            return null;
+        }
+
+        return @enumFromInt(entry.runtime_index);
+    }
+
+    pub fn chipForNode(self: *const Compilation, node_id: Circuit.NodeId) ?ChipIndex {
+        if (node_id.reserved != 0) {
+            return null;
+        }
+
+        const slot: usize = @intCast(node_id.index);
+
+        if (slot >= self.node_to_chip.len) {
+            return null;
+        }
+
+        const entry = self.node_to_chip[slot];
+
+        if (!entry.valid) {
+            return null;
+        }
+
+        if (entry.generation != node_id.generation) {
+            return null;
+        }
+
+        return @enumFromInt(entry.runtime_index);
     }
 
     pub fn createRuntime(self: *Compilation, allocator: std.mem.Allocator) !CompiledCircuit {
         std.debug.assert(self.topology_owned);
 
         const runtime: CompiledCircuit = try .init(allocator, &self.topology);
+
         self.topology_owned = false;
 
         return runtime;
@@ -60,12 +124,36 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !Compilati
     const chip_to_node = try allocator.alloc(Circuit.NodeId, chip_count);
     errdefer allocator.free(chip_to_node);
 
+    const net_to_bus = try allocator.alloc(ReverseEntry, circuit.nets.slots.items.len);
+    errdefer allocator.free(net_to_bus);
+    @memset(net_to_bus, .{});
+
+    const node_to_chip = try allocator.alloc(ReverseEntry, circuit.nodes.slots.items.len);
+    errdefer allocator.free(node_to_chip);
+    @memset(node_to_chip, .{});
+
     for (bus_to_net, 0..) |*net_id, i| {
-        net_id.* = circuit.nets.handleAtDenseIndex(i) orelse unreachable;
+        const handle = circuit.nets.handleAtDenseIndex(i) orelse unreachable;
+
+        net_id.* = handle;
+
+        net_to_bus[@intCast(handle.index)] = .{
+            .generation = handle.generation,
+            .valid = true,
+            .runtime_index = @intCast(i),
+        };
     }
 
     for (chip_to_node, 0..) |*node_id, i| {
-        node_id.* = circuit.nodes.handleAtDenseIndex(i) orelse unreachable;
+        const handle = circuit.nodes.handleAtDenseIndex(i) orelse unreachable;
+
+        node_id.* = handle;
+
+        node_to_chip[@intCast(handle.index)] = .{
+            .generation = handle.generation,
+            .valid = true,
+            .runtime_index = @intCast(i),
+        };
     }
 
     var input_cursor: usize = 0;
@@ -109,8 +197,12 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !Compilati
 
     return .{
         .topology = topology,
+
         .bus_to_net = bus_to_net,
         .chip_to_node = chip_to_node,
+
+        .net_to_bus = net_to_bus,
+        .node_to_chip = node_to_chip,
     };
 }
 
@@ -158,20 +250,14 @@ test "compile circuit and run" {
         std.testing.allocator,
     );
 
-    const a_bus: BusIndex =
-        @enumFromInt(
-            circuit.nets.denseIndex(a).?,
-        );
+    const a_bus =
+        compilation.busForNet(a).?;
 
-    const b_bus: BusIndex =
-        @enumFromInt(
-            circuit.nets.denseIndex(b).?,
-        );
+    const b_bus =
+        compilation.busForNet(b).?;
 
-    const out_bus: BusIndex =
-        @enumFromInt(
-            circuit.nets.denseIndex(out).?,
-        );
+    const out_bus =
+        compilation.busForNet(out).?;
 
     var runtime = try compilation.createRuntime(
         std.testing.allocator,
@@ -438,5 +524,89 @@ test "compilation keeps runtime identity snapshot" {
     try std.testing.expect(
         compilation.bus_to_net[output_bus]
             .eql(output),
+    );
+}
+
+test "reverse compilation lookup survives editor mutation" {
+    var circuit =
+        Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const node = try circuit.addNode(
+        .not1,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const input = try circuit.addNet();
+    const output = try circuit.addNet();
+
+    try circuit.connectInput(
+        node,
+        0,
+        input,
+    );
+
+    try circuit.connectOutput(
+        node,
+        0,
+        output,
+    );
+
+    var compilation = try compile(
+        std.testing.allocator,
+        &circuit,
+    );
+    defer compilation.deinit(
+        std.testing.allocator,
+    );
+
+    const input_bus =
+        compilation.busForNet(input).?;
+
+    const output_bus =
+        compilation.busForNet(output).?;
+
+    const node_chip =
+        compilation.chipForNode(node).?;
+
+    // Mutate the editor after the snapshot was compiled.
+    try std.testing.expect(
+        circuit.removeNet(output),
+    );
+
+    const replacement =
+        try circuit.addNet();
+
+    // The slot may have been reused, but the generation changed.
+    try std.testing.expectEqual(
+        output.index,
+        replacement.index,
+    );
+
+    try std.testing.expect(
+        output.generation !=
+            replacement.generation,
+    );
+
+    // The old handle still maps into the old compilation snapshot.
+    try std.testing.expectEqual(
+        input_bus,
+        compilation.busForNet(input).?,
+    );
+
+    try std.testing.expectEqual(
+        output_bus,
+        compilation.busForNet(output).?,
+    );
+
+    try std.testing.expectEqual(
+        node_chip,
+        compilation.chipForNode(node).?,
+    );
+
+    // A new editor object created after compilation does not exist
+    // in the old runtime snapshot.
+    try std.testing.expect(
+        compilation.busForNet(replacement) == null,
     );
 }
