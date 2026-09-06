@@ -49,6 +49,16 @@ pub const ChipOrigin = struct {
     node: Circuit.NodeId,
 };
 
+pub const NetOrigin = struct {
+    path_start: u32,
+    path_len: u32,
+
+    circuit: Circuit.Id,
+    net: Circuit.NetId,
+
+    bus: BusIndex,
+};
+
 pub const Compilation = struct {
     topology: Topology,
 
@@ -56,6 +66,7 @@ pub const Compilation = struct {
     output_buses: []BusIndex,
 
     chip_origins: []ChipOrigin,
+    net_origins: []NetOrigin,
     origin_path: []InstancePathEntry,
 
     topology_owned: bool = true,
@@ -66,6 +77,7 @@ pub const Compilation = struct {
         }
 
         allocator.free(self.origin_path);
+        allocator.free(self.net_origins);
         allocator.free(self.chip_origins);
 
         allocator.free(self.output_buses);
@@ -181,6 +193,9 @@ pub fn compile(
     const chip_origins = try allocator.alloc(ChipOrigin, chip_count);
     errdefer allocator.free(chip_origins);
 
+    var net_origins: std.ArrayListUnmanaged(NetOrigin) = .empty;
+    defer net_origins.deinit(allocator);
+
     var origin_path: std.ArrayListUnmanaged(InstancePathEntry) = .empty;
     defer origin_path.deinit(allocator);
 
@@ -214,6 +229,7 @@ pub fn compile(
         chip_specs,
         inputs,
         chip_origins,
+        &net_origins,
         &origin_path,
         &path,
         &chip_cursor,
@@ -230,6 +246,10 @@ pub fn compile(
 
     for (chip_specs) |*chip| {
         chip.output = aliases.find(chip.output);
+    }
+
+    for (net_origins.items) |*origin| {
+        origin.bus = aliases.find(origin.bus);
     }
 
     const input_buses = try allocator.alloc(BusIndex, root.inputs.items.len);
@@ -250,6 +270,9 @@ pub fn compile(
         output_buses[i] = aliases.find(root_bus_map[dense_index]);
     }
 
+    const owned_net_origins = try net_origins.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_net_origins);
+
     const owned_origin_path = try origin_path.toOwnedSlice(allocator);
     errdefer allocator.free(owned_origin_path);
 
@@ -262,6 +285,7 @@ pub fn compile(
             .input_buses = input_buses,
             .output_buses = output_buses,
             .chip_origins = chip_origins,
+            .net_origins = owned_net_origins,
             .origin_path = owned_origin_path,
         },
     };
@@ -368,6 +392,7 @@ fn emitCircuit(
     chip_specs: []ChipSpec,
     inputs: []BusIndex,
     chip_origins: []ChipOrigin,
+    net_origins: *std.ArrayListUnmanaged(NetOrigin),
     origin_path: *std.ArrayListUnmanaged(InstancePathEntry),
     path: *std.ArrayListUnmanaged(InstancePathEntry),
     chip_cursor: *usize,
@@ -378,6 +403,28 @@ fn emitCircuit(
 
     std.debug.assert(bus_map.len == circuit.nets.values.items.len);
     std.debug.assert(chip_origins.len == chip_specs.len);
+
+    for (circuit.nets.values.items, 0..) |_, dense_index| {
+        const net_id = circuit.nets.handleAtDenseIndex(dense_index) orelse unreachable;
+        const path_end = std.math.add(usize, origin_path.items.len, path.items.len) catch
+            return error.TopologyTooLarge;
+
+        if (path_end > std.math.maxInt(u32)) {
+            return error.TopologyTooLarge;
+        }
+
+        const path_start: u32 = @intCast(origin_path.items.len);
+        const path_len: u32 = @intCast(path.items.len);
+
+        try origin_path.appendSlice(allocator, path.items);
+        try net_origins.append(allocator, .{
+            .path_start = path_start,
+            .path_len = path_len,
+            .circuit = circuit_id,
+            .net = net_id,
+            .bus = bus_map[dense_index],
+        });
+    }
 
     for (circuit.nodes.values.items, 0..) |node, dense_index| {
         const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
@@ -459,6 +506,7 @@ fn emitCircuit(
                     chip_specs,
                     inputs,
                     chip_origins,
+                    net_origins,
                     origin_path,
                     path,
                     chip_cursor,
@@ -1677,6 +1725,18 @@ test "pass-through subcircuit aliases input and output" {
             compilation.output_buses[0],
         ),
     );
+
+    var aliased_count: usize = 0;
+
+    for (compilation.net_origins) |origin| {
+        if (origin.bus == compilation.input_buses[0]) {
+            aliased_count += 1;
+        }
+    }
+
+    try std.testing.expect(
+        aliased_count >= 3,
+    );
 }
 
 test "pass-through aliases primitive buses" {
@@ -2071,4 +2131,226 @@ test "chip origins distinguish repeated nested instances" {
     try std.testing.expect(
         second_path[1].node.eql(leaf_instance),
     );
+}
+
+test "net origins distinguish repeated subcircuit instances" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id =
+        try project.addCircuit();
+
+    const root_id =
+        try project.addCircuit();
+
+    var middle_net: Circuit.NetId = undefined;
+
+    {
+        const child =
+            project.get(child_id).?;
+
+        const input =
+            try child.addNet();
+
+        middle_net =
+            try child.addNet();
+
+        const output =
+            try child.addNet();
+
+        _ = try child.addInput(input);
+        _ = try child.addOutput(output);
+
+        const first =
+            try child.addNode(
+                .not1,
+                .{ .x = 0, .y = 0 },
+            );
+
+        const second =
+            try child.addNode(
+                .not1,
+                .{ .x = 100, .y = 0 },
+            );
+
+        try child.connectInput(
+            first,
+            0,
+            input,
+        );
+
+        try child.connectOutput(
+            first,
+            0,
+            middle_net,
+        );
+
+        try child.connectInput(
+            second,
+            0,
+            middle_net,
+        );
+
+        try child.connectOutput(
+            second,
+            0,
+            output,
+        );
+    }
+
+    var first_instance: Circuit.NodeId = undefined;
+    var second_instance: Circuit.NodeId = undefined;
+
+    {
+        const child =
+            project.getConst(child_id).?;
+
+        const root =
+            project.get(root_id).?;
+
+        const a =
+            try root.addNet();
+
+        const b =
+            try root.addNet();
+
+        const x =
+            try root.addNet();
+
+        const y =
+            try root.addNet();
+
+        _ = try root.addInput(a);
+        _ = try root.addInput(b);
+
+        _ = try root.addOutput(x);
+        _ = try root.addOutput(y);
+
+        first_instance =
+            try root.addSubcircuitNode(
+                child_id,
+                child,
+                .{ .x = 0, .y = 0 },
+            );
+
+        second_instance =
+            try root.addSubcircuitNode(
+                child_id,
+                child,
+                .{ .x = 0, .y = 100 },
+            );
+
+        try root.connectInput(
+            first_instance,
+            0,
+            a,
+        );
+
+        try root.connectOutput(
+            first_instance,
+            0,
+            x,
+        );
+
+        try root.connectInput(
+            second_instance,
+            0,
+            b,
+        );
+
+        try root.connectOutput(
+            second_instance,
+            0,
+            y,
+        );
+    }
+
+    var compilation =
+        try compileSuccess(
+            &project,
+            root_id,
+        );
+    defer compilation.deinit(
+        std.testing.allocator,
+    );
+
+    var found: [2]NetOrigin = undefined;
+    var found_count: usize = 0;
+
+    for (compilation.net_origins) |origin| {
+        if (!origin.circuit.eql(child_id)) {
+            continue;
+        }
+
+        if (!origin.net.eql(middle_net)) {
+            continue;
+        }
+
+        try std.testing.expect(
+            found_count < found.len,
+        );
+
+        found[found_count] = origin;
+        found_count += 1;
+    }
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        found_count,
+    );
+
+    try std.testing.expect(
+        found[0].bus != found[1].bus,
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        found[0].path_len,
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        found[1].path_len,
+    );
+
+    const first_start: usize =
+        @intCast(found[0].path_start);
+
+    const second_start: usize =
+        @intCast(found[1].path_start);
+
+    const first_path =
+        compilation.origin_path[first_start .. first_start + 1];
+
+    const second_path =
+        compilation.origin_path[second_start .. second_start + 1];
+
+    try std.testing.expect(
+        first_path[0].circuit.eql(root_id),
+    );
+
+    try std.testing.expect(
+        second_path[0].circuit.eql(root_id),
+    );
+
+    const first_is_first =
+        first_path[0].node.eql(first_instance);
+
+    const first_is_second =
+        first_path[0].node.eql(second_instance);
+
+    try std.testing.expect(
+        first_is_first or first_is_second,
+    );
+
+    if (first_is_first) {
+        try std.testing.expect(
+            second_path[0].node.eql(second_instance),
+        );
+    } else {
+        try std.testing.expect(
+            second_path[0].node.eql(first_instance),
+        );
+    }
 }
