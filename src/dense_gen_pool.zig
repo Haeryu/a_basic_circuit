@@ -34,10 +34,10 @@ pub fn DenseGenPool(comptime T: type, comptime HandleType: type) type {
 
         pub const Handle = HandleType;
 
-        slots: std.ArrayList(Slot),
-        values: std.ArrayList(T),
+        slots: std.ArrayListUnmanaged(Slot),
+        values: std.ArrayListUnmanaged(T),
 
-        value_slots: std.ArrayList(u32),
+        value_slots: std.ArrayListUnmanaged(u32),
 
         free_head: u32,
 
@@ -232,6 +232,22 @@ pub fn DenseGenPool(comptime T: type, comptime HandleType: type) type {
             }
 
             return @intCast(slot.index_or_next);
+        }
+
+        pub fn handleAtDenseIndex(self: *const Self, dense_index: usize) ?Handle {
+            if (dense_index >= self.values.items.len) {
+                return null;
+            }
+
+            const slot_index = self.value_slots.items[dense_index];
+            const slot = &self.slots.items[@intCast(slot_index)];
+
+            std.debug.assert(slot.state.live);
+
+            return .{
+                .generation = slot.state.generation,
+                .index = slot_index,
+            };
         }
     };
 }
