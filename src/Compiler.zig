@@ -16,6 +16,46 @@ const ReverseEntry = packed struct(u64) {
     runtime_index: u32 = 0,
 };
 
+pub const FlatCompilation = struct {
+    topology: Topology,
+
+    input_buses: []BusIndex,
+    output_buses: []BusIndex,
+
+    topology_owned: bool = true,
+
+    pub fn deinit(self: *FlatCompilation, allocator: std.mem.Allocator) void {
+        if (self.topology_owned) {
+            self.topology.deinit(allocator);
+        }
+
+        allocator.free(self.output_buses);
+        allocator.free(self.input_buses);
+
+        self.* = undefined;
+    }
+
+    pub fn createRuntime(self: *FlatCompilation, allocator: std.mem.Allocator) !CompiledCircuit {
+        std.debug.assert(self.topology_owned);
+
+        const runtime: CompiledCircuit = try .init(allocator, &self.topology);
+        self.topology_owned = false;
+
+        return runtime;
+    }
+};
+
+const HierarchyPinDiagnostic = struct {
+    circuit: Circuit.Id,
+    node: Circuit.NodeId,
+    port: u16,
+};
+
+const HierarchyDiagnostic = union(enum) {
+    unconnected_input: HierarchyPinDiagnostic,
+    unconnected_output: HierarchyPinDiagnostic,
+};
+
 pub const PinDiagnostic = struct {
     node: Circuit.NodeId,
     port: u16,
@@ -349,6 +389,84 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !CompileRe
     };
 }
 
+pub fn compileProject(
+    allocator: std.mem.Allocator,
+    project: *const Project,
+    root_id: Circuit.Id,
+) !FlatCompilation {
+    try validateHierarchy(allocator, project, root_id);
+
+    const root = project.getConst(root_id) orelse return error.InvalidCircuit;
+    const chip_count = try countPrimitiveNodes(project, root_id);
+    const input_count = try countPrimitiveInputs(project, root_id);
+    const chip_specs = try allocator.alloc(ChipSpec, chip_count);
+    defer allocator.free(chip_specs);
+
+    const inputs = try allocator.alloc(BusIndex, input_count);
+    defer allocator.free(inputs);
+
+    const root_bus_map = try allocator.alloc(BusIndex, root.nets.values.items.len);
+    defer allocator.free(root_bus_map);
+
+    for (root_bus_map, 0..) |*bus, i| {
+        if (i > std.math.maxInt(u32)) {
+            return error.TopologyTooLarge;
+        }
+
+        bus.* = @enumFromInt(i);
+    }
+
+    if (root_bus_map.len > std.math.maxInt(u32)) {
+        return error.TopologyTooLarge;
+    }
+
+    var next_bus: u32 = @intCast(root_bus_map.len);
+    var chip_cursor: usize = 0;
+    var input_cursor: usize = 0;
+
+    try emitCircuit(
+        allocator,
+        project,
+        root_id,
+        root_bus_map,
+        chip_specs,
+        inputs,
+        &chip_cursor,
+        &input_cursor,
+        &next_bus,
+    );
+
+    std.debug.assert(chip_cursor == chip_count);
+    std.debug.assert(input_cursor == input_count);
+
+    const input_buses = try allocator.alloc(BusIndex, root.inputs.items.len);
+    errdefer allocator.free(input_buses);
+
+    const output_buses = try allocator.alloc(BusIndex, root.outputs.items.len);
+    errdefer allocator.free(output_buses);
+
+    for (root.inputs.items, 0..) |port, i| {
+        const dense_index = root.nets.denseIndex(port.net) orelse unreachable;
+
+        input_buses[i] = root_bus_map[dense_index];
+    }
+
+    for (root.outputs.items, 0..) |port, i| {
+        const dense_index = root.nets.denseIndex(port.net) orelse unreachable;
+
+        output_buses[i] = root_bus_map[dense_index];
+    }
+
+    var topology: Topology = try .init(allocator, next_bus, chip_specs);
+    errdefer topology.deinit(allocator);
+
+    return .{
+        .topology = topology,
+        .input_buses = input_buses,
+        .output_buses = output_buses,
+    };
+}
+
 fn countPrimitiveNodes(project: *const Project, circuit_id: Circuit.Id) !usize {
     const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
 
@@ -370,6 +488,212 @@ fn countPrimitiveNodes(project: *const Project, circuit_id: Circuit.Id) !usize {
     return count;
 }
 
+fn makeChildBusMap(
+    allocator: std.mem.Allocator,
+    child: *const Circuit,
+    parent_node: *const Circuit.Node,
+    parent: *const Circuit,
+    parent_bus_map: []const BusIndex,
+    next_bus: *u32,
+) ![]BusIndex {
+    std.debug.assert(parent_node.inputCount() == child.inputs.items.len);
+    std.debug.assert(parent_node.outputCount() == child.outputs.items.len);
+
+    const bus_map = try allocator.alloc(BusIndex, child.nets.values.items.len);
+    errdefer allocator.free(bus_map);
+
+    const invalid = std.math.maxInt(u32);
+
+    for (bus_map) |*bus| {
+        bus.* = @enumFromInt(invalid);
+    }
+
+    for (child.inputs.items, 0..) |port, i| {
+        const child_dense = child.nets.denseIndex(port.net) orelse unreachable;
+        const parent_net = parent_node.connections[i] orelse unreachable;
+        const parent_dense = parent.nets.denseIndex(parent_net) orelse unreachable;
+
+        bus_map[child_dense] = parent_bus_map[parent_dense];
+    }
+
+    const output_start = parent_node.inputCount();
+
+    for (child.outputs.items, 0..) |port, i| {
+        const child_dense = child.nets.denseIndex(port.net) orelse unreachable;
+        const parent_net = parent_node.connections[output_start + i] orelse unreachable;
+        const parent_dense = parent.nets.denseIndex(parent_net) orelse unreachable;
+        const existing = @intFromEnum(bus_map[child_dense]);
+
+        if (existing != invalid) {
+            // Pass-through interfaces need bus aliasing.
+            if (existing != @intFromEnum(parent_bus_map[parent_dense])) {
+                return error.InterfaceAlias;
+            }
+
+            continue;
+        }
+
+        bus_map[child_dense] = parent_bus_map[parent_dense];
+    }
+
+    for (bus_map) |*bus| {
+        if (@intFromEnum(bus.*) != invalid) {
+            continue;
+        }
+
+        if (next_bus.* == std.math.maxInt(u32)) {
+            return error.TopologyTooLarge;
+        }
+
+        bus.* = @enumFromInt(next_bus.*);
+        next_bus.* += 1;
+    }
+
+    return bus_map;
+}
+
+fn emitPrimitiveNodes(
+    circuit: *const Circuit,
+    bus_map: []const BusIndex,
+    chip_specs: []ChipSpec,
+    inputs: []BusIndex,
+    chip_cursor: *usize,
+    input_cursor: *usize,
+) !void {
+    std.debug.assert(bus_map.len == circuit.nets.values.items.len);
+
+    for (circuit.nodes.values.items) |node| {
+        const op = switch (node.kind) {
+            .primitive => |op| op,
+            .subcircuit => return error.NestedSubcircuit,
+        };
+
+        const node_input_count = node.inputCount();
+        const node_output_count = node.outputCount();
+
+        if (node_output_count != 1) {
+            return error.UnsupportedOutputCount;
+        }
+
+        std.debug.assert(chip_cursor.* < chip_specs.len);
+        std.debug.assert(input_cursor.* + node_input_count <= inputs.len);
+
+        const input_start = input_cursor.*;
+
+        for (0..node_input_count) |port| {
+            const net_id = node.connections[port] orelse unreachable;
+            const dense_index = circuit.nets.denseIndex(net_id) orelse unreachable;
+
+            inputs[input_start + port] = bus_map[dense_index];
+        }
+
+        const output_net = node.connections[node_input_count] orelse unreachable;
+        const output_dense_index = circuit.nets.denseIndex(output_net) orelse unreachable;
+
+        chip_specs[chip_cursor.*] = .{
+            .op = op,
+            .inputs = inputs[input_start .. input_start + node_input_count],
+            .output = bus_map[output_dense_index],
+        };
+
+        chip_cursor.* += 1;
+        input_cursor.* += node_input_count;
+    }
+}
+
+fn countPrimitiveInputs(project: *const Project, circuit_id: Circuit.Id) !usize {
+    const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
+
+    var count: usize = 0;
+    for (circuit.nodes.values.items) |node| {
+        switch (node.kind) {
+            .primitive => {
+                count = std.math.add(usize, count, node.inputCount()) catch
+                    return error.TopologyTooLarge;
+            },
+            .subcircuit => |child_id| {
+                const child_count = try countPrimitiveInputs(project, child_id);
+                count = std.math.add(usize, count, child_count) catch
+                    return error.TopologyTooLarge;
+            },
+        }
+    }
+
+    return count;
+}
+
+fn emitCircuit(
+    allocator: std.mem.Allocator,
+    project: *const Project,
+    circuit_id: Circuit.Id,
+    bus_map: []const BusIndex,
+    chip_specs: []ChipSpec,
+    inputs: []BusIndex,
+    chip_cursor: *usize,
+    input_cursor: *usize,
+    next_bus: *u32,
+) !void {
+    const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
+
+    std.debug.assert(bus_map.len == circuit.nets.values.items.len);
+
+    for (circuit.nodes.values.items) |node| {
+        switch (node.kind) {
+            .primitive => |op| {
+                const input_count = node.inputCount();
+                if (node.outputCount() != 1) {
+                    return error.UnsupportedOutputCount;
+                }
+
+                const input_start = input_cursor.*;
+                for (0..input_count) |port| {
+                    const net_id = node.connections[port] orelse unreachable;
+                    const dense_index = circuit.nets.denseIndex(net_id) orelse unreachable;
+
+                    inputs[input_start + port] = bus_map[dense_index];
+                }
+
+                const output_net = node.connections[input_count] orelse unreachable;
+                const output_dense = circuit.nets.denseIndex(output_net) orelse unreachable;
+
+                chip_specs[chip_cursor.*] = .{
+                    .op = op,
+                    .inputs = inputs[input_start .. input_start + input_count],
+                    .output = bus_map[output_dense],
+                };
+
+                chip_cursor.* += 1;
+                input_cursor.* += input_count;
+            },
+
+            .subcircuit => |child_id| {
+                const child = project.getConst(child_id) orelse return error.InvalidCircuit;
+                const child_bus_map = try makeChildBusMap(
+                    allocator,
+                    child,
+                    &node,
+                    circuit,
+                    bus_map,
+                    next_bus,
+                );
+                defer allocator.free(child_bus_map);
+
+                try emitCircuit(
+                    allocator,
+                    project,
+                    child_id,
+                    child_bus_map,
+                    chip_specs,
+                    inputs,
+                    chip_cursor,
+                    input_cursor,
+                    next_bus,
+                );
+            },
+        }
+    }
+}
+
 fn compileSuccess(
     circuit: *const Circuit,
 ) !Compilation {
@@ -388,6 +712,118 @@ fn compileSuccess(
             return error.UnexpectedCompileFailure;
         },
     };
+}
+
+fn validateHierarchy(
+    allocator: std.mem.Allocator,
+    project: *const Project,
+    root_id: Circuit.Id,
+) !void {
+    var active: std.bit_set.DynamicBitSetUnmanaged = try .initEmpty(
+        allocator,
+        project.circuits.slots.items.len,
+    );
+    defer active.deinit(allocator);
+
+    try validateHierarchyRecursive(project, root_id, &active);
+}
+
+fn validateHierarchyRecursive(
+    project: *const Project,
+    circuit_id: Circuit.Id,
+    active: *std.bit_set.DynamicBitSetUnmanaged,
+) !void {
+    const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
+    const slot: usize = @intCast(circuit_id.index);
+
+    if (active.isSet(slot)) {
+        return error.CircuitCycle;
+    }
+
+    active.set(slot);
+    defer active.unset(slot);
+
+    for (circuit.nodes.values.items) |node| {
+        switch (node.kind) {
+            .primitive => {},
+            .subcircuit => |child_id| {
+                const child = project.getConst(child_id) orelse return error.InvalidCircuit;
+
+                if (node.inputCount() != child.inputs.items.len or
+                    node.outputCount() != child.outputs.items.len)
+                {
+                    return error.SubcircuitInterfaceChanged;
+                }
+
+                try validateHierarchyRecursive(project, child_id, active);
+            },
+        }
+    }
+}
+
+fn validateHierarchyPins(
+    allocator: std.mem.Allocator,
+    project: *const Project,
+    circuit_id: Circuit.Id,
+    visited: *std.bit_set.DynamicBitSetUnmanaged,
+    diagnostics: *std.ArrayListUnmanaged(HierarchyDiagnostic),
+) !void {
+    const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
+
+    const slot: usize = @intCast(circuit_id.index);
+
+    if (visited.isSet(slot)) {
+        return;
+    }
+
+    visited.set(slot);
+
+    for (circuit.nodes.values.items, 0..) |node, dense_index| {
+        const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
+        const input_count = node.inputCount();
+        const output_count = node.outputCount();
+
+        for (0..input_count) |port| {
+            if (node.connections[port] != null) {
+                continue;
+            }
+
+            try diagnostics.append(allocator, .{
+                .unconnected_input = .{
+                    .circuit = circuit_id,
+                    .node = node_id,
+                    .port = @intCast(port),
+                },
+            });
+        }
+
+        for (0..output_count) |port| {
+            if (node.connections[input_count + port] != null) {
+                continue;
+            }
+
+            try diagnostics.append(allocator, .{
+                .unconnected_output = .{
+                    .circuit = circuit_id,
+                    .node = node_id,
+                    .port = @intCast(port),
+                },
+            });
+        }
+
+        switch (node.kind) {
+            .primitive => {},
+            .subcircuit => |child_id| {
+                try validateHierarchyPins(
+                    allocator,
+                    project,
+                    child_id,
+                    visited,
+                    diagnostics,
+                );
+            },
+        }
+    }
 }
 
 test "compile reports all unconnected pins" {
@@ -1534,4 +1970,1187 @@ test "compiler counts primitive nodes through hierarchy" {
             parent_id,
         ),
     );
+}
+
+test "subcircuit interface maps onto parent buses" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id = try project.addCircuit();
+    const parent_id = try project.addCircuit();
+
+    const child = project.get(child_id).?;
+
+    const child_in = try child.addNet();
+    const child_mid = try child.addNet();
+    const child_out = try child.addNet();
+
+    _ = try child.addInput(child_in);
+    _ = try child.addOutput(child_out);
+
+    const first = try child.addNode(
+        .not1,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const second = try child.addNode(
+        .not1,
+        .{ .x = 100, .y = 0 },
+    );
+
+    try child.connectInput(
+        first,
+        0,
+        child_in,
+    );
+
+    try child.connectOutput(
+        first,
+        0,
+        child_mid,
+    );
+
+    try child.connectInput(
+        second,
+        0,
+        child_mid,
+    );
+
+    try child.connectOutput(
+        second,
+        0,
+        child_out,
+    );
+
+    const parent = project.get(parent_id).?;
+
+    const a = try parent.addNet();
+    const b = try parent.addNet();
+
+    const instance = try parent.addSubcircuitNode(
+        child_id,
+        child,
+        .{ .x = 0, .y = 0 },
+    );
+
+    try parent.connectInput(
+        instance,
+        0,
+        a,
+    );
+
+    try parent.connectOutput(
+        instance,
+        0,
+        b,
+    );
+
+    const parent_bus_map = [_]BusIndex{
+        @enumFromInt(0),
+        @enumFromInt(1),
+    };
+
+    var next_bus: u32 = 2;
+
+    const instance_node =
+        parent.nodes.get(instance).?;
+
+    const child_bus_map =
+        try makeChildBusMap(
+            std.testing.allocator,
+            child,
+            instance_node,
+            parent,
+            &parent_bus_map,
+            &next_bus,
+        );
+
+    defer std.testing.allocator.free(
+        child_bus_map,
+    );
+
+    const child_in_dense =
+        child.nets.denseIndex(child_in).?;
+
+    const child_mid_dense =
+        child.nets.denseIndex(child_mid).?;
+
+    const child_out_dense =
+        child.nets.denseIndex(child_out).?;
+
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        @intFromEnum(
+            child_bus_map[child_in_dense],
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        @intFromEnum(
+            child_bus_map[child_out_dense],
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        @intFromEnum(
+            child_bus_map[child_mid_dense],
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 3),
+        next_bus,
+    );
+}
+
+test "primitive nodes emit through remapped buses" {
+    var child =
+        Circuit.init(std.testing.allocator);
+    defer child.deinit();
+
+    const input = try child.addNet();
+    const middle = try child.addNet();
+    const output = try child.addNet();
+
+    const first = try child.addNode(
+        .not1,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const second = try child.addNode(
+        .not1,
+        .{ .x = 100, .y = 0 },
+    );
+
+    try child.connectInput(
+        first,
+        0,
+        input,
+    );
+
+    try child.connectOutput(
+        first,
+        0,
+        middle,
+    );
+
+    try child.connectInput(
+        second,
+        0,
+        middle,
+    );
+
+    try child.connectOutput(
+        second,
+        0,
+        output,
+    );
+
+    // Flat buses:
+    //
+    // parent input  = 0
+    // parent output = 1
+    // child middle  = 2
+
+    var bus_map =
+        try std.testing.allocator.alloc(
+            BusIndex,
+            child.nets.values.items.len,
+        );
+    defer std.testing.allocator.free(
+        bus_map,
+    );
+
+    bus_map[
+        child.nets.denseIndex(input).?
+    ] = @enumFromInt(0);
+
+    bus_map[
+        child.nets.denseIndex(middle).?
+    ] = @enumFromInt(2);
+
+    bus_map[
+        child.nets.denseIndex(output).?
+    ] = @enumFromInt(1);
+
+    var chip_specs: [2]ChipSpec = undefined;
+    var inputs: [2]BusIndex = undefined;
+
+    var chip_cursor: usize = 0;
+    var input_cursor: usize = 0;
+
+    try emitPrimitiveNodes(
+        &child,
+        bus_map,
+        &chip_specs,
+        &inputs,
+        &chip_cursor,
+        &input_cursor,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        chip_cursor,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        input_cursor,
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        @intFromEnum(
+            chip_specs[0].inputs[0],
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        @intFromEnum(
+            chip_specs[0].output,
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        @intFromEnum(
+            chip_specs[1].inputs[0],
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        @intFromEnum(
+            chip_specs[1].output,
+        ),
+    );
+}
+
+test "one level subcircuit flatten runs" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id = try project.addCircuit();
+    const parent_id = try project.addCircuit();
+
+    // Child:
+    //
+    // IN -> NOT -> MIDDLE -> NOT -> OUT
+
+    const child = project.get(child_id).?;
+
+    const child_input = try child.addNet();
+    const child_middle = try child.addNet();
+    const child_output = try child.addNet();
+
+    _ = try child.addInput(child_input);
+    _ = try child.addOutput(child_output);
+
+    const first = try child.addNode(
+        .not1,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const second = try child.addNode(
+        .not1,
+        .{ .x = 100, .y = 0 },
+    );
+
+    try child.connectInput(
+        first,
+        0,
+        child_input,
+    );
+
+    try child.connectOutput(
+        first,
+        0,
+        child_middle,
+    );
+
+    try child.connectInput(
+        second,
+        0,
+        child_middle,
+    );
+
+    try child.connectOutput(
+        second,
+        0,
+        child_output,
+    );
+
+    // Parent:
+    //
+    // A -> [ child ] -> B
+
+    const parent = project.get(parent_id).?;
+
+    const a = try parent.addNet();
+    const b = try parent.addNet();
+
+    _ = try parent.addInput(a);
+    _ = try parent.addOutput(b);
+
+    const instance = try parent.addSubcircuitNode(
+        child_id,
+        child,
+        .{ .x = 0, .y = 0 },
+    );
+
+    try parent.connectInput(
+        instance,
+        0,
+        a,
+    );
+
+    try parent.connectOutput(
+        instance,
+        0,
+        b,
+    );
+
+    // Root buses are assigned first.
+    const parent_bus_map = [_]BusIndex{
+        @enumFromInt(0),
+        @enumFromInt(1),
+    };
+
+    var next_bus: u32 = 2;
+
+    const instance_node =
+        parent.nodes.get(instance).?;
+
+    const child_bus_map =
+        try makeChildBusMap(
+            std.testing.allocator,
+            child,
+            instance_node,
+            parent,
+            &parent_bus_map,
+            &next_bus,
+        );
+    defer std.testing.allocator.free(
+        child_bus_map,
+    );
+
+    // Flatten result:
+    //
+    // A          = bus 0
+    // B          = bus 1
+    // child mid  = bus 2
+
+    try std.testing.expectEqual(
+        @as(u32, 3),
+        next_bus,
+    );
+
+    var chip_specs: [2]ChipSpec =
+        undefined;
+
+    var inputs: [2]BusIndex =
+        undefined;
+
+    var chip_cursor: usize = 0;
+    var input_cursor: usize = 0;
+
+    try emitPrimitiveNodes(
+        child,
+        child_bus_map,
+        &chip_specs,
+        &inputs,
+        &chip_cursor,
+        &input_cursor,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        chip_cursor,
+    );
+
+    var topology = try Topology.init(
+        std.testing.allocator,
+        next_bus,
+        &chip_specs,
+    );
+    errdefer topology.deinit(
+        std.testing.allocator,
+    );
+
+    var runtime = try CompiledCircuit.init(
+        std.testing.allocator,
+        &topology,
+    );
+    defer runtime.deinit();
+
+    const input_bus: BusIndex =
+        @enumFromInt(0);
+
+    const output_bus: BusIndex =
+        @enumFromInt(1);
+
+    try runtime.store(
+        input_bus,
+        false,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        false,
+        try runtime.load(output_bus),
+    );
+
+    try runtime.store(
+        input_bus,
+        true,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try runtime.load(output_bus),
+    );
+
+    try runtime.store(
+        input_bus,
+        false,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        false,
+        try runtime.load(output_bus),
+    );
+}
+
+test "recursive subcircuit flatten runs" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const leaf_id =
+        try project.addCircuit();
+
+    const middle_id =
+        try project.addCircuit();
+
+    const root_id =
+        try project.addCircuit();
+
+    // Leaf:
+    //
+    // IN -> NOT -> OUT
+
+    const leaf = project.get(leaf_id).?;
+
+    const leaf_in = try leaf.addNet();
+    const leaf_out = try leaf.addNet();
+
+    _ = try leaf.addInput(leaf_in);
+    _ = try leaf.addOutput(leaf_out);
+
+    const not_node = try leaf.addNode(
+        .not1,
+        .{ .x = 0, .y = 0 },
+    );
+
+    try leaf.connectInput(
+        not_node,
+        0,
+        leaf_in,
+    );
+
+    try leaf.connectOutput(
+        not_node,
+        0,
+        leaf_out,
+    );
+
+    // Middle:
+    //
+    // IN -> [leaf] -> X -> [leaf] -> OUT
+
+    const middle = project.get(middle_id).?;
+
+    const middle_in = try middle.addNet();
+    const middle_x = try middle.addNet();
+    const middle_out = try middle.addNet();
+
+    _ = try middle.addInput(middle_in);
+    _ = try middle.addOutput(middle_out);
+
+    const first = try middle.addSubcircuitNode(
+        leaf_id,
+        leaf,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const second = try middle.addSubcircuitNode(
+        leaf_id,
+        leaf,
+        .{ .x = 100, .y = 0 },
+    );
+
+    try middle.connectInput(
+        first,
+        0,
+        middle_in,
+    );
+
+    try middle.connectOutput(
+        first,
+        0,
+        middle_x,
+    );
+
+    try middle.connectInput(
+        second,
+        0,
+        middle_x,
+    );
+
+    try middle.connectOutput(
+        second,
+        0,
+        middle_out,
+    );
+
+    // Root:
+    //
+    // A -> [middle] -> B
+
+    const root = project.get(root_id).?;
+
+    const a = try root.addNet();
+    const b = try root.addNet();
+
+    _ = try root.addInput(a);
+    _ = try root.addOutput(b);
+
+    const instance =
+        try root.addSubcircuitNode(
+            middle_id,
+            middle,
+            .{ .x = 0, .y = 0 },
+        );
+
+    try root.connectInput(
+        instance,
+        0,
+        a,
+    );
+
+    try root.connectOutput(
+        instance,
+        0,
+        b,
+    );
+
+    const chip_count =
+        try countPrimitiveNodes(
+            &project,
+            root_id,
+        );
+
+    const input_count =
+        try countPrimitiveInputs(
+            &project,
+            root_id,
+        );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        chip_count,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        input_count,
+    );
+
+    const chip_specs =
+        try std.testing.allocator.alloc(
+            ChipSpec,
+            chip_count,
+        );
+    defer std.testing.allocator.free(
+        chip_specs,
+    );
+
+    const inputs =
+        try std.testing.allocator.alloc(
+            BusIndex,
+            input_count,
+        );
+    defer std.testing.allocator.free(
+        inputs,
+    );
+
+    const root_bus_map =
+        try std.testing.allocator.alloc(
+            BusIndex,
+            root.nets.values.items.len,
+        );
+    defer std.testing.allocator.free(
+        root_bus_map,
+    );
+
+    for (root_bus_map, 0..) |*bus, i| {
+        bus.* = @enumFromInt(i);
+    }
+
+    var next_bus: u32 =
+        @intCast(root_bus_map.len);
+
+    var chip_cursor: usize = 0;
+    var input_cursor: usize = 0;
+
+    try emitCircuit(
+        std.testing.allocator,
+        &project,
+        root_id,
+        root_bus_map,
+        chip_specs,
+        inputs,
+        &chip_cursor,
+        &input_cursor,
+        &next_bus,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        chip_cursor,
+    );
+
+    // Root A/B plus middle's internal X.
+    try std.testing.expectEqual(
+        @as(u32, 3),
+        next_bus,
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        @intFromEnum(
+            chip_specs[0].inputs[0],
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        @intFromEnum(
+            chip_specs[0].output,
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        @intFromEnum(
+            chip_specs[1].inputs[0],
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        @intFromEnum(
+            chip_specs[1].output,
+        ),
+    );
+
+    var topology = try Topology.init(
+        std.testing.allocator,
+        next_bus,
+        chip_specs,
+    );
+    errdefer topology.deinit(
+        std.testing.allocator,
+    );
+
+    var runtime = try CompiledCircuit.init(
+        std.testing.allocator,
+        &topology,
+    );
+    defer runtime.deinit();
+
+    const a_bus: BusIndex =
+        @enumFromInt(0);
+
+    const b_bus: BusIndex =
+        @enumFromInt(1);
+
+    try runtime.store(
+        a_bus,
+        false,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        false,
+        try runtime.load(b_bus),
+    );
+
+    try runtime.store(
+        a_bus,
+        true,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try runtime.load(b_bus),
+    );
+}
+
+test "compile project flattens nested subcircuits and runs" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const leaf_id = try project.addCircuit();
+    const middle_id = try project.addCircuit();
+    const root_id = try project.addCircuit();
+
+    // Leaf:
+    //
+    // IN -> NOT -> OUT
+
+    {
+        const leaf = project.get(leaf_id).?;
+
+        const input = try leaf.addNet();
+        const output = try leaf.addNet();
+
+        _ = try leaf.addInput(input);
+        _ = try leaf.addOutput(output);
+
+        const node = try leaf.addNode(
+            .not1,
+            .{ .x = 0, .y = 0 },
+        );
+
+        try leaf.connectInput(
+            node,
+            0,
+            input,
+        );
+
+        try leaf.connectOutput(
+            node,
+            0,
+            output,
+        );
+    }
+
+    // Middle:
+    //
+    // IN -> [leaf] -> OUT
+
+    {
+        const leaf =
+            project.getConst(leaf_id).?;
+
+        const middle =
+            project.get(middle_id).?;
+
+        const input = try middle.addNet();
+        const output = try middle.addNet();
+
+        _ = try middle.addInput(input);
+        _ = try middle.addOutput(output);
+
+        const node =
+            try middle.addSubcircuitNode(
+                leaf_id,
+                leaf,
+                .{ .x = 0, .y = 0 },
+            );
+
+        try middle.connectInput(
+            node,
+            0,
+            input,
+        );
+
+        try middle.connectOutput(
+            node,
+            0,
+            output,
+        );
+    }
+
+    // Root:
+    //
+    // A -> [middle] -> B
+
+    {
+        const middle =
+            project.getConst(middle_id).?;
+
+        const root =
+            project.get(root_id).?;
+
+        const a = try root.addNet();
+        const b = try root.addNet();
+
+        _ = try root.addInput(a);
+        _ = try root.addOutput(b);
+
+        const node =
+            try root.addSubcircuitNode(
+                middle_id,
+                middle,
+                .{ .x = 0, .y = 0 },
+            );
+
+        try root.connectInput(
+            node,
+            0,
+            a,
+        );
+
+        try root.connectOutput(
+            node,
+            0,
+            b,
+        );
+    }
+
+    var compilation =
+        try compileProject(
+            std.testing.allocator,
+            &project,
+            root_id,
+        );
+    defer compilation.deinit(
+        std.testing.allocator,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        compilation.topology.ops.len,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        compilation.input_buses.len,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        compilation.output_buses.len,
+    );
+
+    var runtime =
+        try compilation.createRuntime(
+            std.testing.allocator,
+        );
+    defer runtime.deinit();
+
+    const input_bus =
+        compilation.input_buses[0];
+
+    const output_bus =
+        compilation.output_buses[0];
+
+    try runtime.store(
+        input_bus,
+        false,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try runtime.load(output_bus),
+    );
+
+    try runtime.store(
+        input_bus,
+        true,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        false,
+        try runtime.load(output_bus),
+    );
+
+    try runtime.store(
+        input_bus,
+        false,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try runtime.load(output_bus),
+    );
+}
+
+test "compile project rejects subcircuit cycle" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const a_id = try project.addCircuit();
+    const b_id = try project.addCircuit();
+
+    {
+        const b = project.getConst(b_id).?;
+        const a = project.get(a_id).?;
+
+        _ = try a.addSubcircuitNode(
+            b_id,
+            b,
+            .{ .x = 0, .y = 0 },
+        );
+    }
+
+    {
+        const a = project.getConst(a_id).?;
+        const b = project.get(b_id).?;
+
+        _ = try b.addSubcircuitNode(
+            a_id,
+            a,
+            .{ .x = 0, .y = 0 },
+        );
+    }
+
+    try std.testing.expectError(
+        error.CircuitCycle,
+        compileProject(
+            std.testing.allocator,
+            &project,
+            a_id,
+        ),
+    );
+}
+
+test "compile project rejects stale subcircuit id" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id =
+        try project.addCircuit();
+
+    const root_id =
+        try project.addCircuit();
+
+    {
+        const child =
+            project.getConst(child_id).?;
+
+        const root =
+            project.get(root_id).?;
+
+        _ = try root.addSubcircuitNode(
+            child_id,
+            child,
+            .{ .x = 0, .y = 0 },
+        );
+    }
+
+    try std.testing.expect(
+        project.removeCircuit(child_id),
+    );
+
+    try std.testing.expect(
+        project.get(child_id) == null,
+    );
+
+    // Reuse the sparse slot with a new generation.
+    const replacement =
+        try project.addCircuit();
+
+    try std.testing.expectEqual(
+        child_id.index,
+        replacement.index,
+    );
+
+    try std.testing.expect(
+        child_id.generation !=
+            replacement.generation,
+    );
+
+    try std.testing.expectError(
+        error.InvalidCircuit,
+        compileProject(
+            std.testing.allocator,
+            &project,
+            root_id,
+        ),
+    );
+}
+
+test "compile project rejects changed subcircuit interface" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id =
+        try project.addCircuit();
+
+    const root_id =
+        try project.addCircuit();
+
+    {
+        const child =
+            project.get(child_id).?;
+
+        const input = try child.addNet();
+        const output = try child.addNet();
+
+        _ = try child.addInput(input);
+        _ = try child.addOutput(output);
+    }
+
+    {
+        const child =
+            project.getConst(child_id).?;
+
+        const root =
+            project.get(root_id).?;
+
+        _ = try root.addSubcircuitNode(
+            child_id,
+            child,
+            .{ .x = 0, .y = 0 },
+        );
+    }
+
+    // Mutate the child interface after the instance was created.
+    {
+        const child =
+            project.get(child_id).?;
+
+        const extra = try child.addNet();
+
+        _ = try child.addInput(extra);
+    }
+
+    try std.testing.expectError(
+        error.SubcircuitInterfaceChanged,
+        compileProject(
+            std.testing.allocator,
+            &project,
+            root_id,
+        ),
+    );
+}
+
+test "hierarchy validation finds unconnected pin in child" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id =
+        try project.addCircuit();
+
+    const root_id =
+        try project.addCircuit();
+
+    const child_node = blk: {
+        const child =
+            project.get(child_id).?;
+
+        const node = try child.addNode(
+            .not1,
+            .{ .x = 0, .y = 0 },
+        );
+
+        break :blk node;
+    };
+
+    {
+        const child =
+            project.getConst(child_id).?;
+
+        const root =
+            project.get(root_id).?;
+
+        _ = try root.addSubcircuitNode(
+            child_id,
+            child,
+            .{ .x = 0, .y = 0 },
+        );
+    }
+
+    var visited =
+        try std.bit_set.DynamicBitSetUnmanaged.initEmpty(
+            std.testing.allocator,
+            project.circuits.slots.items.len,
+        );
+    defer visited.deinit(
+        std.testing.allocator,
+    );
+
+    var diagnostics: std.ArrayListUnmanaged(HierarchyDiagnostic) =
+        .empty;
+    defer diagnostics.deinit(
+        std.testing.allocator,
+    );
+
+    try validateHierarchyPins(
+        std.testing.allocator,
+        &project,
+        root_id,
+        &visited,
+        &diagnostics,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        diagnostics.items.len,
+    );
+
+    switch (diagnostics.items[0]) {
+        .unconnected_input => |pin| {
+            try std.testing.expect(
+                pin.circuit.eql(child_id),
+            );
+
+            try std.testing.expect(
+                pin.node.eql(child_node),
+            );
+
+            try std.testing.expectEqual(
+                @as(u16, 0),
+                pin.port,
+            );
+        },
+
+        else => return error.UnexpectedDiagnostic,
+    }
+
+    switch (diagnostics.items[1]) {
+        .unconnected_output => |pin| {
+            try std.testing.expect(
+                pin.circuit.eql(child_id),
+            );
+
+            try std.testing.expect(
+                pin.node.eql(child_node),
+            );
+
+            try std.testing.expectEqual(
+                @as(u16, 0),
+                pin.port,
+            );
+        },
+
+        else => return error.UnexpectedDiagnostic,
+    }
 }
