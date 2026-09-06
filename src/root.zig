@@ -3,6 +3,7 @@ pub const Circuit = @import("Circuit.zig");
 pub const dense_gen_pool = @import("dense_gen_pool.zig");
 pub const op = @import("op.zig");
 pub const Compiler = @import("Compiler.zig");
+pub const Project = @import("Project.zig");
 
 test {
     _ = CompiledCircuit;
@@ -10,4 +11,5 @@ test {
     _ = dense_gen_pool;
     _ = op;
     _ = Compiler;
+    _ = Project;
 }
