@@ -170,8 +170,8 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !CompileRe
     for (circuit.nodes.values.items, 0..) |node, dense_index| {
         const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
 
-        const node_input_count = node.op.inputCount();
-        const node_output_count = node.op.outputCount();
+        const node_input_count = node.inputCount();
+        const node_output_count = node.outputCount();
 
         input_count = std.math.add(usize, input_count, node_input_count) catch
             return error.TopologyTooLarge;
@@ -277,8 +277,8 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !CompileRe
 
     var input_cursor: usize = 0;
     for (circuit.nodes.values.items, 0..) |node, chip_index| {
-        const node_input_count = node.op.inputCount();
-        const node_output_count = node.op.outputCount();
+        const node_input_count = node.inputCount();
+        const node_output_count = node.outputCount();
 
         for (0..node_input_count) |port| {
             const net_id = node.connections[port] orelse unreachable;
@@ -297,12 +297,15 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !CompileRe
         const output_dense_index = circuit.nets.denseIndex(output_net_id) orelse
             return error.InvalidNet;
 
+        const op = switch (node.kind) {
+            .primitive => |op| op,
+            .subcircuit => unreachable,
+        };
+
         chip_specs[chip_index] = .{
-            .op = node.op,
+            .op = op,
             .inputs = inputs[input_cursor .. input_cursor + node_input_count],
-            .output = @enumFromInt(
-                output_dense_index,
-            ),
+            .output = @enumFromInt(output_dense_index),
         };
 
         input_cursor += node_input_count;
@@ -1419,4 +1422,47 @@ test "compile rejects internally driven external input" {
             }
         },
     }
+}
+
+test "primitive node stores kind and pin layout" {
+    const Op = @import("op.zig").Op;
+
+    var circuit =
+        Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const id = try circuit.addNode(
+        .and2,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const node = circuit.nodes.get(id).?;
+
+    switch (node.kind) {
+        .primitive => |op| {
+            try std.testing.expectEqual(
+                Op.and2,
+                op,
+            );
+        },
+
+        .subcircuit => {
+            return error.UnexpectedNodeKind;
+        },
+    }
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        node.inputCount(),
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        node.outputCount(),
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        node.connections.len,
+    );
 }

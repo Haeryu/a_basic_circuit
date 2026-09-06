@@ -8,9 +8,11 @@ const Op = @import("op.zig").Op;
 
 const NodeTag = enum {};
 const NetTag = enum {};
+const CircuitTag = enum {};
 
 pub const NodeId = GenHandle(NodeTag);
 pub const NetId = GenHandle(NetTag);
+pub const Id = GenHandle(CircuitTag);
 
 pub const Vec2 = struct {
     x: f32,
@@ -27,12 +29,27 @@ pub const OutputPin = struct {
     port: u16,
 };
 
+pub const NodeKind = union(enum) {
+    primitive: Op,
+    subcircuit: Circuit.Id,
+};
+
 pub const Node = struct {
-    op: Op,
+    kind: NodeKind,
     position: Vec2,
+
+    input_count: u16,
 
     // [ inputs ][ outputs ]
     connections: []?NetId,
+
+    pub fn inputCount(self: Node) usize {
+        return self.input_count;
+    }
+
+    pub fn outputCount(self: Node) usize {
+        return self.connections.len - self.input_count;
+    }
 };
 
 pub const Net = struct {
@@ -103,15 +120,18 @@ pub fn addNode(self: *Circuit, op: Op, position: Vec2) !NodeId {
     @memset(connections, null);
 
     return self.nodes.create(self.gpa, .{
-        .op = op,
+        .kind = .{
+            .primitive = op,
+        },
         .position = position,
+        .input_count = @intCast(input_count),
         .connections = connections,
     });
 }
 
 pub fn removeNode(self: *Circuit, node_id: NodeId) bool {
     const node = self.nodes.get(node_id) orelse return false;
-    const input_count = node.op.inputCount();
+    const input_count = node.inputCount();
     const output_count = node.connections.len - input_count;
 
     for (0..input_count) |port| {
@@ -156,7 +176,7 @@ pub fn removeNet(self: *Circuit, net_id: NetId) bool {
 
     if (net.driver) |driver| {
         const node = self.nodes.get(driver.node) orelse unreachable;
-        const index = @as(usize, node.op.inputCount()) + @as(usize, driver.port);
+        const index = @as(usize, node.inputCount()) + @as(usize, driver.port);
 
         std.debug.assert(index < node.connections.len);
         std.debug.assert(node.connections[index].?.eql(net_id));
@@ -169,7 +189,7 @@ pub fn removeNet(self: *Circuit, net_id: NetId) bool {
 
         const port: usize = consumer.port;
 
-        std.debug.assert(port < node.op.inputCount());
+        std.debug.assert(port < node.inputCount());
         std.debug.assert(node.connections[port].?.eql(net_id));
 
         node.connections[port] = null;
@@ -183,7 +203,7 @@ pub fn removeNet(self: *Circuit, net_id: NetId) bool {
 pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
     const node = self.nodes.get(node_id) orelse return error.InvalidNode;
 
-    if (port >= node.op.inputCount()) {
+    if (port >= node.inputCount()) {
         return error.InvalidPort;
     }
 
@@ -223,7 +243,7 @@ pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId)
 pub fn disconnectInput(self: *Circuit, node_id: NodeId, port: usize) void {
     const node = self.nodes.get(node_id) orelse return;
 
-    if (port >= node.op.inputCount()) {
+    if (port >= node.inputCount()) {
         return;
     }
 
@@ -246,7 +266,7 @@ pub fn disconnectInput(self: *Circuit, node_id: NodeId, port: usize) void {
 pub fn connectOutput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
     const node = self.nodes.get(node_id) orelse return error.InvalidNode;
 
-    const input_count = node.op.inputCount();
+    const input_count = node.inputCount();
     const output_count = node.connections.len - input_count;
 
     if (port >= output_count) {
@@ -289,7 +309,7 @@ pub fn connectOutput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId
 
 pub fn disconnectOutput(self: *Circuit, node_id: NodeId, port: usize) void {
     const node = self.nodes.get(node_id) orelse return;
-    const input_count = node.op.inputCount();
+    const input_count = node.inputCount();
     const output_count = node.connections.len - input_count;
 
     if (port >= output_count) {

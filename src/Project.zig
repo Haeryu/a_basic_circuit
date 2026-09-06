@@ -6,13 +6,9 @@ const Circuit = @import("Circuit.zig");
 const DenseGenPool = @import("dense_gen_pool.zig").DenseGenPool;
 const GenHandle = @import("dense_gen_pool.zig").GenHandle;
 
-const CircuitTag = enum {};
-
-pub const CircuitId = GenHandle(CircuitTag);
-
 const CircuitPool = DenseGenPool(
     Circuit,
-    CircuitId,
+    Circuit.Id,
 );
 
 gpa: std.mem.Allocator,
@@ -35,21 +31,21 @@ pub fn deinit(self: *Project) void {
     self.* = undefined;
 }
 
-pub fn addCircuit(self: *Project) !CircuitId {
+pub fn addCircuit(self: *Project) !Circuit.Id {
     return self.circuits.create(self.gpa, .init(self.gpa));
 }
 
-pub fn removeCircuit(self: *Project, id: CircuitId) bool {
+pub fn removeCircuit(self: *Project, id: Circuit.Id) bool {
     const circuit = self.circuits.get(id) orelse return false;
     circuit.deinit();
     return self.circuits.destroy(id);
 }
 
-pub fn get(self: *Project, id: CircuitId) ?*Circuit {
+pub fn get(self: *Project, id: Circuit.Id) ?*Circuit {
     return self.circuits.get(id);
 }
 
-pub fn getConst(self: *const Project, id: CircuitId) ?*const Circuit {
+pub fn getConst(self: *const Project, id: Circuit.Id) ?*const Circuit {
     return self.circuits.getConst(id);
 }
 
