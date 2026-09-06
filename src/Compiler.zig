@@ -36,11 +36,27 @@ pub const CompileFailure = struct {
     }
 };
 
+pub const InstancePathEntry = struct {
+    circuit: Circuit.Id,
+    node: Circuit.NodeId,
+};
+
+pub const ChipOrigin = struct {
+    path_start: u32,
+    path_len: u32,
+
+    circuit: Circuit.Id,
+    node: Circuit.NodeId,
+};
+
 pub const Compilation = struct {
     topology: Topology,
 
     input_buses: []BusIndex,
     output_buses: []BusIndex,
+
+    chip_origins: []ChipOrigin,
+    origin_path: []InstancePathEntry,
 
     topology_owned: bool = true,
 
@@ -48,6 +64,9 @@ pub const Compilation = struct {
         if (self.topology_owned) {
             self.topology.deinit(allocator);
         }
+
+        allocator.free(self.origin_path);
+        allocator.free(self.chip_origins);
 
         allocator.free(self.output_buses);
         allocator.free(self.input_buses);
@@ -159,6 +178,15 @@ pub fn compile(
     const inputs = try allocator.alloc(BusIndex, input_count);
     defer allocator.free(inputs);
 
+    const chip_origins = try allocator.alloc(ChipOrigin, chip_count);
+    errdefer allocator.free(chip_origins);
+
+    var origin_path: std.ArrayListUnmanaged(InstancePathEntry) = .empty;
+    defer origin_path.deinit(allocator);
+
+    var path: std.ArrayListUnmanaged(InstancePathEntry) = .empty;
+    defer path.deinit(allocator);
+
     const root_bus_count = root.nets.values.items.len;
 
     if (root_bus_count > std.math.maxInt(u32)) {
@@ -185,6 +213,9 @@ pub fn compile(
         root_bus_map,
         chip_specs,
         inputs,
+        chip_origins,
+        &origin_path,
+        &path,
         &chip_cursor,
         &input_cursor,
         &aliases,
@@ -219,6 +250,9 @@ pub fn compile(
         output_buses[i] = aliases.find(root_bus_map[dense_index]);
     }
 
+    const owned_origin_path = try origin_path.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_origin_path);
+
     var topology: Topology = try .init(allocator, aliases.parents.items.len, chip_specs);
     errdefer topology.deinit(allocator);
 
@@ -227,6 +261,8 @@ pub fn compile(
             .topology = topology,
             .input_buses = input_buses,
             .output_buses = output_buses,
+            .chip_origins = chip_origins,
+            .origin_path = owned_origin_path,
         },
     };
 }
@@ -331,6 +367,9 @@ fn emitCircuit(
     bus_map: []const BusIndex,
     chip_specs: []ChipSpec,
     inputs: []BusIndex,
+    chip_origins: []ChipOrigin,
+    origin_path: *std.ArrayListUnmanaged(InstancePathEntry),
+    path: *std.ArrayListUnmanaged(InstancePathEntry),
     chip_cursor: *usize,
     input_cursor: *usize,
     aliases: *BusAliases,
@@ -338,8 +377,11 @@ fn emitCircuit(
     const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
 
     std.debug.assert(bus_map.len == circuit.nets.values.items.len);
+    std.debug.assert(chip_origins.len == chip_specs.len);
 
-    for (circuit.nodes.values.items) |node| {
+    for (circuit.nodes.values.items, 0..) |node, dense_index| {
+        const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
+
         switch (node.kind) {
             .primitive => |op| {
                 const input_count = node.inputCount();
@@ -352,12 +394,11 @@ fn emitCircuit(
                 std.debug.assert(input_cursor.* + input_count <= inputs.len);
 
                 const input_start = input_cursor.*;
-
                 for (0..input_count) |port| {
                     const net_id = node.connections[port] orelse unreachable;
-                    const dense_index = circuit.nets.denseIndex(net_id) orelse unreachable;
+                    const dense_net_index = circuit.nets.denseIndex(net_id) orelse unreachable;
 
-                    inputs[input_start + port] = bus_map[dense_index];
+                    inputs[input_start + port] = bus_map[dense_net_index];
                 }
 
                 const output_net = node.connections[input_count] orelse unreachable;
@@ -369,12 +410,31 @@ fn emitCircuit(
                     .output = bus_map[output_dense],
                 };
 
+                const path_end = std.math.add(usize, origin_path.items.len, path.items.len) catch
+                    return error.TopologyTooLarge;
+
+                if (path_end > std.math.maxInt(u32)) {
+                    return error.TopologyTooLarge;
+                }
+
+                const path_start: u32 = @intCast(origin_path.items.len);
+                const path_len: u32 = @intCast(path.items.len);
+
+                try origin_path.appendSlice(allocator, path.items);
+
+                chip_origins[chip_cursor.*] = .{
+                    .path_start = path_start,
+                    .path_len = path_len,
+                    .circuit = circuit_id,
+                    .node = node_id,
+                };
+
                 chip_cursor.* += 1;
                 input_cursor.* += input_count;
             },
+
             .subcircuit => |child_id| {
                 const child = project.getConst(child_id) orelse return error.InvalidCircuit;
-
                 const child_bus_map = try makeChildBusMap(
                     allocator,
                     child,
@@ -385,6 +445,12 @@ fn emitCircuit(
                 );
                 defer allocator.free(child_bus_map);
 
+                try path.append(allocator, .{
+                    .circuit = circuit_id,
+                    .node = node_id,
+                });
+                defer path.items.len -= 1;
+
                 try emitCircuit(
                     allocator,
                     project,
@@ -392,6 +458,9 @@ fn emitCircuit(
                     child_bus_map,
                     chip_specs,
                     inputs,
+                    chip_origins,
+                    origin_path,
+                    path,
                     chip_cursor,
                     input_cursor,
                     aliases,
@@ -1757,5 +1826,249 @@ test "pass-through aliases primitive buses" {
         try runtime.load(
             compilation.output_buses[0],
         ),
+    );
+}
+
+test "chip origins distinguish repeated nested instances" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const leaf_id =
+        try project.addCircuit();
+
+    const middle_id =
+        try project.addCircuit();
+
+    const root_id =
+        try project.addCircuit();
+
+    var leaf_node: Circuit.NodeId = undefined;
+
+    {
+        const leaf =
+            project.get(leaf_id).?;
+
+        const input =
+            try leaf.addNet();
+
+        const output =
+            try leaf.addNet();
+
+        _ = try leaf.addInput(input);
+        _ = try leaf.addOutput(output);
+
+        leaf_node =
+            try leaf.addNode(
+                .not1,
+                .{ .x = 0, .y = 0 },
+            );
+
+        try leaf.connectInput(
+            leaf_node,
+            0,
+            input,
+        );
+
+        try leaf.connectOutput(
+            leaf_node,
+            0,
+            output,
+        );
+    }
+
+    var leaf_instance: Circuit.NodeId = undefined;
+
+    {
+        const leaf =
+            project.getConst(leaf_id).?;
+
+        const middle =
+            project.get(middle_id).?;
+
+        const input =
+            try middle.addNet();
+
+        const output =
+            try middle.addNet();
+
+        _ = try middle.addInput(input);
+        _ = try middle.addOutput(output);
+
+        leaf_instance =
+            try middle.addSubcircuitNode(
+                leaf_id,
+                leaf,
+                .{ .x = 0, .y = 0 },
+            );
+
+        try middle.connectInput(
+            leaf_instance,
+            0,
+            input,
+        );
+
+        try middle.connectOutput(
+            leaf_instance,
+            0,
+            output,
+        );
+    }
+
+    var first_instance: Circuit.NodeId = undefined;
+    var second_instance: Circuit.NodeId = undefined;
+
+    {
+        const middle =
+            project.getConst(middle_id).?;
+
+        const root =
+            project.get(root_id).?;
+
+        const a =
+            try root.addNet();
+
+        const b =
+            try root.addNet();
+
+        const x =
+            try root.addNet();
+
+        const y =
+            try root.addNet();
+
+        _ = try root.addInput(a);
+        _ = try root.addInput(b);
+
+        _ = try root.addOutput(x);
+        _ = try root.addOutput(y);
+
+        first_instance =
+            try root.addSubcircuitNode(
+                middle_id,
+                middle,
+                .{ .x = 0, .y = 0 },
+            );
+
+        second_instance =
+            try root.addSubcircuitNode(
+                middle_id,
+                middle,
+                .{ .x = 0, .y = 100 },
+            );
+
+        try root.connectInput(
+            first_instance,
+            0,
+            a,
+        );
+
+        try root.connectOutput(
+            first_instance,
+            0,
+            x,
+        );
+
+        try root.connectInput(
+            second_instance,
+            0,
+            b,
+        );
+
+        try root.connectOutput(
+            second_instance,
+            0,
+            y,
+        );
+    }
+
+    var compilation =
+        try compileSuccess(
+            &project,
+            root_id,
+        );
+    defer compilation.deinit(
+        std.testing.allocator,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        compilation.chip_origins.len,
+    );
+
+    const first =
+        compilation.chip_origins[0];
+
+    const second =
+        compilation.chip_origins[1];
+
+    try std.testing.expect(
+        first.circuit.eql(leaf_id),
+    );
+
+    try std.testing.expect(
+        second.circuit.eql(leaf_id),
+    );
+
+    try std.testing.expect(
+        first.node.eql(leaf_node),
+    );
+
+    try std.testing.expect(
+        second.node.eql(leaf_node),
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        first.path_len,
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        second.path_len,
+    );
+
+    const first_start: usize =
+        @intCast(first.path_start);
+
+    const second_start: usize =
+        @intCast(second.path_start);
+
+    const first_path =
+        compilation.origin_path[first_start .. first_start + first.path_len];
+
+    const second_path =
+        compilation.origin_path[second_start .. second_start + second.path_len];
+
+    try std.testing.expect(
+        first_path[0].circuit.eql(root_id),
+    );
+
+    try std.testing.expect(
+        first_path[0].node.eql(first_instance),
+    );
+
+    try std.testing.expect(
+        first_path[1].circuit.eql(middle_id),
+    );
+
+    try std.testing.expect(
+        first_path[1].node.eql(leaf_instance),
+    );
+
+    try std.testing.expect(
+        second_path[0].circuit.eql(root_id),
+    );
+
+    try std.testing.expect(
+        second_path[0].node.eql(second_instance),
+    );
+
+    try std.testing.expect(
+        second_path[1].circuit.eql(middle_id),
+    );
+
+    try std.testing.expect(
+        second_path[1].node.eql(leaf_instance),
     );
 }
