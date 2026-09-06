@@ -55,10 +55,16 @@ pub const Compilation = struct {
 
     topology_owned: bool = true,
 
+    input_buses: []BusIndex,
+    output_buses: []BusIndex,
+
     pub fn deinit(self: *Compilation, allocator: std.mem.Allocator) void {
         if (self.topology_owned) {
             self.topology.deinit(allocator);
         }
+
+        allocator.free(self.output_buses);
+        allocator.free(self.input_buses);
 
         allocator.free(self.node_to_chip);
         allocator.free(self.net_to_bus);
@@ -258,6 +264,24 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !CompileRe
         input_cursor += node_input_count;
     }
 
+    const input_buses = try allocator.alloc(BusIndex, circuit.inputs.items.len);
+    errdefer allocator.free(input_buses);
+
+    const output_buses = try allocator.alloc(BusIndex, circuit.outputs.items.len);
+    errdefer allocator.free(output_buses);
+
+    for (circuit.inputs.items, 0..) |port, i| {
+        const dense_index = circuit.nets.denseIndex(port.net) orelse unreachable;
+
+        input_buses[i] = @enumFromInt(dense_index);
+    }
+
+    for (circuit.outputs.items, 0..) |port, i| {
+        const dense_index = circuit.nets.denseIndex(port.net) orelse unreachable;
+
+        output_buses[i] = @enumFromInt(dense_index);
+    }
+
     var topology: Topology = try .init(allocator, bus_count, chip_specs);
     errdefer topology.deinit(allocator);
 
@@ -270,6 +294,9 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !CompileRe
 
             .net_to_bus = net_to_bus,
             .node_to_chip = node_to_chip,
+
+            .input_buses = input_buses,
+            .output_buses = output_buses,
         },
     };
 }
@@ -1013,5 +1040,73 @@ test "reverse compilation lookup survives editor mutation" {
     // Objects created after compilation do not exist in the snapshot.
     try std.testing.expect(
         compilation.busForNet(replacement) == null,
+    );
+}
+
+test "compilation exposes circuit interface" {
+    var circuit =
+        Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    // A ----\
+    //        AND ---- OUT
+    // B ----/
+
+    const node = try circuit.addNode(
+        .and2,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const a = try circuit.addNet();
+    const b = try circuit.addNet();
+    const out = try circuit.addNet();
+
+    try circuit.connectInput(node, 0, a);
+    try circuit.connectInput(node, 1, b);
+    try circuit.connectOutput(node, 0, out);
+
+    _ = try circuit.addInput(a);
+    _ = try circuit.addInput(b);
+    _ = try circuit.addOutput(out);
+
+    var compilation = try compileSuccess(
+        &circuit,
+    );
+    defer compilation.deinit(
+        std.testing.allocator,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        compilation.input_buses.len,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        compilation.output_buses.len,
+    );
+
+    var runtime = try compilation.createRuntime(
+        std.testing.allocator,
+    );
+    defer runtime.deinit();
+
+    try runtime.store(
+        compilation.input_buses[0],
+        true,
+    );
+
+    try runtime.store(
+        compilation.input_buses[1],
+        true,
+    );
+
+    try runtime.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try runtime.load(
+            compilation.output_buses[0],
+        ),
     );
 }

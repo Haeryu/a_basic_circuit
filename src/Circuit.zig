@@ -42,6 +42,10 @@ pub const Net = struct {
     consumers: std.ArrayListUnmanaged(InputPin) = .empty,
 };
 
+pub const InterfacePort = struct {
+    net: NetId,
+};
+
 const NodePool = DenseGenPool(Node, NodeId);
 const NetPool = DenseGenPool(Net, NetId);
 
@@ -50,11 +54,16 @@ gpa: std.mem.Allocator,
 nodes: NodePool,
 nets: NetPool,
 
+inputs: std.ArrayListUnmanaged(InterfacePort),
+outputs: std.ArrayListUnmanaged(InterfacePort),
+
 pub fn init(gpa: std.mem.Allocator) Circuit {
     return .{
         .gpa = gpa,
         .nodes = .init,
         .nets = .init,
+        .inputs = .empty,
+        .outputs = .empty,
     };
 }
 
@@ -66,6 +75,9 @@ pub fn deinit(self: *Circuit) void {
     for (self.nets.values.items) |*net| {
         net.consumers.deinit(self.gpa);
     }
+
+    self.outputs.deinit(self.gpa);
+    self.inputs.deinit(self.gpa);
 
     self.nets.deinit(self.gpa);
     self.nodes.deinit(self.gpa);
@@ -122,6 +134,24 @@ pub fn addNet(self: *Circuit) !NetId {
 }
 
 pub fn removeNet(self: *Circuit, net_id: NetId) bool {
+    var input_index: usize = 0;
+    while (input_index < self.inputs.items.len) {
+        if (self.inputs.items[input_index].net.eql(net_id)) {
+            _ = self.inputs.orderedRemove(input_index);
+        } else {
+            input_index += 1;
+        }
+    }
+
+    var output_index: usize = 0;
+    while (output_index < self.outputs.items.len) {
+        if (self.outputs.items[output_index].net.eql(net_id)) {
+            _ = self.outputs.orderedRemove(output_index);
+        } else {
+            output_index += 1;
+        }
+    }
+
     const net = self.nets.get(net_id) orelse return false;
 
     if (net.driver) |driver| {
@@ -277,6 +307,60 @@ pub fn disconnectOutput(self: *Circuit, node_id: NodeId, port: usize) void {
 
     net.driver = null;
     node.connections[connection_index] = null;
+}
+
+pub fn addInput(self: *Circuit, net_id: NetId) !usize {
+    if (self.nets.get(net_id) == null) {
+        return error.InvalidNet;
+    }
+
+    for (self.inputs.items) |port| {
+        if (port.net.eql(net_id)) {
+            return error.AlreadyInput;
+        }
+    }
+
+    const index = self.inputs.items.len;
+
+    try self.inputs.append(self.gpa, .{ .net = net_id });
+
+    return index;
+}
+
+pub fn addOutput(self: *Circuit, net_id: NetId) !usize {
+    if (self.nets.get(net_id) == null) {
+        return error.InvalidNet;
+    }
+
+    for (self.outputs.items) |port| {
+        if (port.net.eql(net_id)) {
+            return error.AlreadyOutput;
+        }
+    }
+
+    const index = self.outputs.items.len;
+
+    try self.outputs.append(self.gpa, .{ .net = net_id });
+
+    return index;
+}
+
+pub fn removeInput(self: *Circuit, index: usize) bool {
+    if (index >= self.inputs.items.len) {
+        return false;
+    }
+
+    _ = self.inputs.orderedRemove(index);
+    return true;
+}
+
+pub fn removeOutput(self: *Circuit, index: usize) bool {
+    if (index >= self.outputs.items.len) {
+        return false;
+    }
+
+    _ = self.outputs.orderedRemove(index);
+    return true;
 }
 
 test "circuit fanout survives node deletion" {
