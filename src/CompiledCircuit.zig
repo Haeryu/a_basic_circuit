@@ -827,3 +827,162 @@ test "dff samples only on rising edge" {
         try circuit.load(@enumFromInt(2)),
     );
 }
+
+test "dffs sample old state on same rising edge" {
+    var topology = try Topology.init(
+        std.testing.allocator,
+        4,
+        &.{
+            .{
+                .op = .dff,
+                .inputs = &.{
+                    @enumFromInt(0), // D
+                    @enumFromInt(1), // CLK
+                },
+                .output = @enumFromInt(2), // Q0
+            },
+            .{
+                .op = .dff,
+                .inputs = &.{
+                    @enumFromInt(2), // Q0
+                    @enumFromInt(1), // CLK
+                },
+                .output = @enumFromInt(3), // Q1
+            },
+        },
+    );
+    errdefer topology.deinit(std.testing.allocator);
+
+    var circuit = try CompiledCircuit.init(
+        std.testing.allocator,
+        &topology,
+    );
+    defer circuit.deinit();
+
+    // Establish CLK=0 for both DFFs.
+    try circuit.settle(8);
+
+    // D = 1
+    try circuit.store(@enumFromInt(0), true);
+    try circuit.settle(8);
+
+    // First rising edge.
+    try circuit.store(@enumFromInt(1), true);
+    try circuit.settle(8);
+
+    // Both DFFs sampled from the same old snapshot:
+    //
+    // DFF0 saw D=1  -> Q0=1
+    // DFF1 saw Q0=0 -> Q1=0
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(2)),
+    );
+
+    try std.testing.expectEqual(
+        false,
+        try circuit.load(@enumFromInt(3)),
+    );
+
+    // Falling edge.
+    try circuit.store(@enumFromInt(1), false);
+    try circuit.settle(8);
+
+    // Second rising edge.
+    try circuit.store(@enumFromInt(1), true);
+    try circuit.settle(8);
+
+    // Now DFF1 samples the previously committed Q0=1.
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(2)),
+    );
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(3)),
+    );
+}
+
+test "sequential feedback toggles on rising edge" {
+    var topology = try Topology.init(
+        std.testing.allocator,
+        3,
+        &.{
+            .{
+                .op = .not1,
+                .inputs = &.{
+                    @enumFromInt(0), // Q
+                },
+                .output = @enumFromInt(1), // D
+            },
+            .{
+                .op = .dff,
+                .inputs = &.{
+                    @enumFromInt(1), // D
+                    @enumFromInt(2), // CLK
+                },
+                .output = @enumFromInt(0), // Q
+            },
+        },
+    );
+    errdefer topology.deinit(std.testing.allocator);
+
+    var circuit = try CompiledCircuit.init(
+        std.testing.allocator,
+        &topology,
+    );
+    defer circuit.deinit();
+
+    // Initial:
+    //
+    // Q=0
+    // NOT(Q) -> D=1
+    // DFF establishes CLK=0
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        false,
+        try circuit.load(@enumFromInt(0)),
+    );
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(1)),
+    );
+
+    // First rising edge:
+    // D=1 -> Q=1
+    try circuit.store(@enumFromInt(2), true);
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(0)),
+    );
+
+    // NOT propagates Q=1 -> D=0 during settle.
+    try std.testing.expectEqual(
+        false,
+        try circuit.load(@enumFromInt(1)),
+    );
+
+    // Falling edge.
+    try circuit.store(@enumFromInt(2), false);
+    try circuit.settle(8);
+
+    // Second rising edge:
+    // D=0 -> Q=0
+    try circuit.store(@enumFromInt(2), true);
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        false,
+        try circuit.load(@enumFromInt(0)),
+    );
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(1)),
+    );
+}
