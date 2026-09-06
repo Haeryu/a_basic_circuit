@@ -211,6 +211,28 @@ pub fn DenseGenPool(comptime T: type, comptime HandleType: type) type {
 
             return &self.values.items[@intCast(slot.index_or_next)];
         }
+
+        pub fn denseIndex(self: *const Self, handle: Handle) ?usize {
+            if (handle.reserved != 0) {
+                return null;
+            }
+
+            const slot_index: usize = @intCast(handle.index);
+            if (slot_index >= self.slots.items.len) {
+                return null;
+            }
+
+            const slot = &self.slots.items[slot_index];
+            if (!slot.state.live) {
+                return null;
+            }
+
+            if (slot.state.generation != handle.generation) {
+                return null;
+            }
+
+            return @intCast(slot.index_or_next);
+        }
     };
 }
 
