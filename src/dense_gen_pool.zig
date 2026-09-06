@@ -1,6 +1,22 @@
 const std = @import("std");
 
-pub fn DenseGenPool(comptime T: type) type {
+pub fn GenHandle(comptime Tag: type) type {
+    _ = Tag;
+
+    return packed struct(u64) {
+        generation: u31,
+        reserved: u1 = 0,
+        index: u32,
+
+        pub fn eql(self: @This(), other: @This()) bool {
+            return self.generation == other.generation and
+                self.index == other.index and
+                self.reserved == other.reserved;
+        }
+    };
+}
+
+pub fn DenseGenPool(comptime T: type, comptime HandleType: type) type {
     return struct {
         const Self = @This();
 
@@ -16,11 +32,7 @@ pub fn DenseGenPool(comptime T: type) type {
             index_or_next: u32,
         };
 
-        pub const Handle = packed struct(u64) {
-            generation: u31,
-            reserved: u1 = 0,
-            index: u32,
-        };
+        pub const Handle = HandleType;
 
         slots: std.ArrayList(Slot),
         values: std.ArrayList(T),
@@ -203,7 +215,8 @@ pub fn DenseGenPool(comptime T: type) type {
 }
 
 test "dense gen pool keeps handles stable across swap remove" {
-    const Pool = DenseGenPool(u32);
+    const TestId = GenHandle(enum {});
+    const Pool = DenseGenPool(u32, TestId);
 
     var pool: Pool = .init;
     defer pool.deinit(std.testing.allocator);

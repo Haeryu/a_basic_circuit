@@ -2,16 +2,23 @@ const Circuit = @This();
 
 const std = @import("std");
 
-pub const NodeId = enum(u32) {
-    _,
-};
-pub const NetId = enum(u32) {
-    _,
-};
+const DenseGenPool = @import("dense_gen_pool.zig").DenseGenPool;
+const GenHandle = @import("dense_gen_pool.zig").GenHandle;
+
+const NodeTag = enum {};
+const NetTag = enum {};
+
+pub const NodeId = GenHandle(NodeTag);
+pub const NetId = GenHandle(NetTag);
 
 pub const Vec2 = struct {
     x: f32,
     y: f32,
+};
+
+pub const InputPin = struct {
+    node: NodeId,
+    port: u16,
 };
 
 pub const OutputPin = struct {
@@ -22,125 +29,341 @@ pub const OutputPin = struct {
 pub const Node = struct {
     position: Vec2,
 
-    inputs: []?NetId,
-    outputs: []?NetId,
+    input_count: u16,
+
+    // [ inputs ][ outputs ]
+    connections: []?NetId,
 };
 
 pub const Net = struct {
     driver: ?OutputPin = null,
+
+    // fan-out
+    consumers: std.ArrayListUnmanaged(InputPin) = .empty,
 };
+
+const NodePool = DenseGenPool(Node, NodeId);
+const NetPool = DenseGenPool(Net, NetId);
 
 allocator: std.mem.Allocator,
 
-nodes: std.ArrayListUnmanaged(Node),
-nets: std.ArrayListUnmanaged(Net),
+nodes: NodePool,
+nets: NetPool,
 
 pub fn init(allocator: std.mem.Allocator) Circuit {
     return .{
         .allocator = allocator,
-        .nodes = .empty,
-        .nets = .empty,
+        .nodes = .init,
+        .nets = .init,
     };
 }
 
 pub fn deinit(self: *Circuit) void {
-    for (self.nodes.items) |node| {
-        self.allocator.free(node.outputs);
-        self.allocator.free(node.inputs);
+    for (self.nodes.values.items) |node| {
+        self.allocator.free(node.connections);
     }
 
-    self.nodes.deinit(self.allocator);
+    for (self.nets.values.items) |*net| {
+        net.consumers.deinit(self.allocator);
+    }
+
     self.nets.deinit(self.allocator);
+    self.nodes.deinit(self.allocator);
 
     self.* = undefined;
 }
 
 pub fn addNode(self: *Circuit, input_count: usize, output_count: usize, position: Vec2) !NodeId {
-    if (self.nodes.items.len >= std.math.maxInt(u32)) {
-        return error.TooManyNodes;
+    if (input_count > std.math.maxInt(u16) or output_count > std.math.maxInt(u16)) {
+        return error.TooManyPins;
     }
 
-    const inputs = try self.allocator.alloc(?NetId, input_count);
-    errdefer self.allocator.free(inputs);
+    const total = std.math.add(usize, input_count, output_count) catch {
+        return error.TooManyPins;
+    };
 
-    const outputs = try self.allocator.alloc(?NetId, output_count);
-    errdefer self.allocator.free(outputs);
+    const connections = try self.allocator.alloc(?NetId, total);
+    errdefer self.allocator.free(connections);
 
-    @memset(inputs, null);
-    @memset(outputs, null);
+    @memset(connections, null);
 
-    const id: NodeId = @enumFromInt(self.nodes.items.len);
-
-    try self.nodes.append(self.allocator, .{
+    return self.nodes.create(self.allocator, .{
         .position = position,
-        .inputs = inputs,
-        .outputs = outputs,
+        .input_count = @intCast(input_count),
+        .connections = connections,
     });
+}
 
-    return id;
+pub fn removeNode(self: *Circuit, node_id: NodeId) bool {
+    const node = self.nodes.get(node_id) orelse return false;
+    const input_count: usize = node.input_count;
+    const output_count = node.connections.len - input_count;
+
+    for (0..input_count) |port| {
+        self.disconnectInput(node_id, port);
+    }
+
+    for (0..output_count) |port| {
+        self.disconnectOutput(node_id, port);
+    }
+
+    const node_after_disconnect = self.nodes.get(node_id) orelse unreachable;
+
+    self.allocator.free(node_after_disconnect.connections);
+
+    return self.nodes.destroy(node_id);
 }
 
 pub fn addNet(self: *Circuit) !NetId {
-    if (self.nets.items.len >= std.math.maxInt(u32)) {
-        return error.TooManyNets;
-    }
-
-    const id: NetId = @enumFromInt(self.nets.items.len);
-    try self.nets.append(self.allocator, .{});
-
-    return id;
+    return self.nets.create(self.allocator, .{});
 }
 
-pub fn connectOutput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
-    const node_index: usize = @intCast(@intFromEnum(node_id));
+pub fn removeNet(self: *Circuit, net_id: NetId) bool {
+    const net = self.nets.get(net_id) orelse return false;
 
-    const net_index: usize = @intCast(@intFromEnum(net_id));
+    if (net.driver) |driver| {
+        const node = self.nodes.get(driver.node) orelse unreachable;
+        const index = @as(usize, node.input_count) + @as(usize, driver.port);
 
-    if (node_index >= self.nodes.items.len) {
-        return error.InvalidNode;
+        std.debug.assert(index < node.connections.len);
+        std.debug.assert(node.connections[index].?.eql(net_id));
+
+        node.connections[index] = null;
     }
 
-    if (net_index >= self.nets.items.len) {
-        return error.InvalidNet;
+    for (net.consumers.items) |consumer| {
+        const node = self.nodes.get(consumer.node) orelse unreachable;
+
+        const port: usize = consumer.port;
+
+        std.debug.assert(port < node.input_count);
+        std.debug.assert(node.connections[port].?.eql(net_id));
+
+        node.connections[port] = null;
     }
 
-    const node = &self.nodes.items[node_index];
+    net.consumers.deinit(self.allocator);
 
-    if (port >= node.outputs.len) {
+    return self.nets.destroy(net_id);
+}
+
+pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
+    const node = self.nodes.get(node_id) orelse return error.InvalidNode;
+
+    if (port >= node.input_count) {
         return error.InvalidPort;
     }
 
-    const net = &self.nets.items[net_index];
+    const net = self.nets.get(net_id) orelse return error.InvalidNet;
 
-    if (net.driver != null) {
+    if (node.connections[port]) |old_net_id| {
+        if (old_net_id.eql(net_id)) {
+            return;
+        }
+    }
+
+    try net.consumers.ensureUnusedCapacity(self.allocator, 1);
+
+    if (node.connections[port]) |old_net_id| {
+        const old_net = self.nets.get(old_net_id) orelse unreachable;
+
+        var found = false;
+        for (old_net.consumers.items, 0..) |consumer, i| {
+            if (consumer.node.eql(node_id) and consumer.port == port) {
+                _ = old_net.consumers.swapRemove(i);
+                found = true;
+                break;
+            }
+        }
+
+        std.debug.assert(found);
+    }
+
+    net.consumers.appendAssumeCapacity(.{
+        .node = node_id,
+        .port = @intCast(port),
+    });
+
+    node.connections[port] = net_id;
+}
+
+pub fn disconnectInput(self: *Circuit, node_id: NodeId, port: usize) void {
+    const node = self.nodes.get(node_id) orelse return;
+
+    if (port >= node.input_count) {
+        return;
+    }
+
+    const net_id = node.connections[port] orelse return;
+    const net = self.nets.get(net_id) orelse unreachable;
+    var found = false;
+    for (net.consumers.items, 0..) |consumer, i| {
+        if (consumer.node.eql(node_id) and consumer.port == port) {
+            _ = net.consumers.swapRemove(i);
+            found = true;
+            break;
+        }
+    }
+
+    std.debug.assert(found);
+
+    node.connections[port] = null;
+}
+
+pub fn connectOutput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
+    const node = self.nodes.get(node_id) orelse return error.InvalidNode;
+
+    const input_count: usize = node.input_count;
+    const output_count = node.connections.len - input_count;
+
+    if (port >= output_count) {
+        return error.InvalidPort;
+    }
+
+    const net = self.nets.get(net_id) orelse return error.InvalidNet;
+
+    if (net.driver) |driver| {
+        if (driver.node.eql(node_id) and driver.port == port) {
+            return;
+        }
+
         return error.MultipleDrivers;
     }
 
-    node.outputs[port] = net_id;
+    const connection_index = input_count + port;
+
+    if (node.connections[connection_index]) |old_net_id| {
+        if (old_net_id.eql(net_id)) {
+            return;
+        }
+
+        const old_net = self.nets.get(old_net_id) orelse unreachable;
+
+        std.debug.assert(old_net.driver != null);
+        std.debug.assert(old_net.driver.?.node.eql(node_id));
+        std.debug.assert(old_net.driver.?.port == port);
+
+        old_net.driver = null;
+    }
 
     net.driver = .{
         .node = node_id,
         .port = @intCast(port),
     };
+
+    node.connections[connection_index] = net_id;
 }
 
-pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
-    const node_index: usize = @intCast(@intFromEnum(node_id));
-    const net_index: usize = @intCast(@intFromEnum(net_id));
+pub fn disconnectOutput(self: *Circuit, node_id: NodeId, port: usize) void {
+    const node = self.nodes.get(node_id) orelse return;
+    const input_count: usize = node.input_count;
+    const output_count = node.connections.len - input_count;
 
-    if (node_index >= self.nodes.items.len) {
-        return error.InvalidNode;
+    if (port >= output_count) {
+        return;
     }
 
-    if (net_index >= self.nets.items.len) {
-        return error.InvalidNet;
-    }
+    const connection_index = input_count + port;
+    const net_id = node.connections[connection_index] orelse return;
 
-    const node = &self.nodes.items[node_index];
+    const net = self.nets.get(net_id) orelse unreachable;
 
-    if (port >= node.inputs.len) {
-        return error.InvalidPort;
-    }
+    std.debug.assert(net.driver != null);
+    std.debug.assert(net.driver.?.node.eql(node_id));
+    std.debug.assert(net.driver.?.port == port);
 
-    node.inputs[port] = net_id;
+    net.driver = null;
+    node.connections[connection_index] = null;
+}
+
+test "circuit fanout survives node deletion" {
+    var circuit =
+        Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const source = try circuit.addNode(
+        0,
+        1,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const a = try circuit.addNode(
+        1,
+        0,
+        .{ .x = 100, .y = -50 },
+    );
+
+    const b = try circuit.addNode(
+        1,
+        0,
+        .{ .x = 100, .y = 50 },
+    );
+
+    const net = try circuit.addNet();
+
+    try circuit.connectOutput(
+        source,
+        0,
+        net,
+    );
+
+    try circuit.connectInput(
+        a,
+        0,
+        net,
+    );
+
+    try circuit.connectInput(
+        b,
+        0,
+        net,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        circuit.nets.get(net).?
+            .consumers.items.len,
+    );
+
+    try std.testing.expect(
+        circuit.removeNode(a),
+    );
+
+    try std.testing.expect(
+        circuit.nodes.get(a) == null,
+    );
+
+    try std.testing.expect(
+        circuit.nodes.get(b) != null,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        circuit.nets.get(net).?
+            .consumers.items.len,
+    );
+
+    try std.testing.expect(
+        circuit.nets.get(net).?
+            .consumers.items[0]
+            .node.eql(b),
+    );
+
+    try std.testing.expect(
+        circuit.removeNet(net),
+    );
+
+    try std.testing.expect(
+        circuit.nets.get(net) == null,
+    );
+
+    try std.testing.expect(
+        circuit.nodes.get(source).?
+            .connections[0] == null,
+    );
+
+    try std.testing.expect(
+        circuit.nodes.get(b).?
+            .connections[0] == null,
+    );
 }
