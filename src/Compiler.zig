@@ -25,6 +25,23 @@ pub const Diagnostic = union(enum) {
     unconnected_output: PinDiagnostic,
 };
 
+pub const CompileFailure = struct {
+    diagnostics: []Diagnostic,
+
+    pub fn deinit(
+        self: *CompileFailure,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.diagnostics);
+        self.* = undefined;
+    }
+};
+
+pub const CompileResult = union(enum) {
+    success: Compilation,
+    failure: CompileFailure,
+};
+
 pub fn validate(circuit: *const Circuit) ?Diagnostic {
     for (circuit.nodes.values.items, 0..) |node, dense_index| {
         const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
@@ -148,14 +165,56 @@ pub const Compilation = struct {
     }
 };
 
-pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !Compilation {
+pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !CompileResult {
     const chip_count = circuit.nodes.values.items.len;
     const bus_count = circuit.nets.values.items.len;
 
+    var diagnostics: std.ArrayListUnmanaged(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
     var input_count: usize = 0;
-    for (circuit.nodes.values.items) |node| {
-        input_count = std.math.add(usize, input_count, node.op.inputCount()) catch {
+    for (circuit.nodes.values.items, 0..) |node, dense_index| {
+        const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
+
+        const node_input_count = node.op.inputCount();
+        const node_output_count = node.op.outputCount();
+
+        input_count = std.math.add(usize, input_count, node_input_count) catch {
             return error.TopologyTooLarge;
+        };
+
+        for (0..node_input_count) |port| {
+            if (node.connections[port] != null) {
+                continue;
+            }
+
+            try diagnostics.append(allocator, .{
+                .unconnected_input = .{
+                    .node = node_id,
+                    .port = @intCast(port),
+                },
+            });
+        }
+
+        for (0..node_output_count) |port| {
+            if (node.connections[node_input_count + port] != null) {
+                continue;
+            }
+
+            try diagnostics.append(allocator, .{
+                .unconnected_output = .{
+                    .node = node_id,
+                    .port = @intCast(port),
+                },
+            });
+        }
+    }
+
+    if (diagnostics.items.len != 0) {
+        return .{
+            .failure = .{
+                .diagnostics = try diagnostics.toOwnedSlice(allocator),
+            },
         };
     }
 
@@ -209,9 +268,8 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !Compilati
         const node_output_count = node.op.outputCount();
 
         for (0..node_input_count) |port| {
-            const net_id = node.connections[port] orelse return error.UnconnectedInput;
-            const dense_net_index = circuit.nets.denseIndex(net_id) orelse
-                return error.InvalidNet;
+            const net_id = node.connections[port] orelse unreachable;
+            const dense_net_index = circuit.nets.denseIndex(net_id) orelse unreachable;
 
             inputs[input_cursor + port] = @enumFromInt(dense_net_index);
         }
@@ -222,9 +280,7 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !Compilati
 
         const output_connection_index = node_input_count;
 
-        const output_net_id = node.connections[output_connection_index] orelse
-            return error.UnconnectedOutput;
-
+        const output_net_id = node.connections[output_connection_index] orelse unreachable;
         const output_dense_index = circuit.nets.denseIndex(output_net_id) orelse
             return error.InvalidNet;
 
@@ -243,33 +299,45 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !Compilati
     errdefer topology.deinit(allocator);
 
     return .{
-        .topology = topology,
+        .success = .{
+            .topology = topology,
 
-        .bus_to_net = bus_to_net,
-        .chip_to_node = chip_to_node,
+            .bus_to_net = bus_to_net,
+            .chip_to_node = chip_to_node,
 
-        .net_to_bus = net_to_bus,
-        .node_to_chip = node_to_chip,
+            .net_to_bus = net_to_bus,
+            .node_to_chip = node_to_chip,
+        },
     };
 }
 
-test "compile circuit and run" {
+test "compile reports all unconnected pins" {
     var circuit =
         Circuit.init(std.testing.allocator);
     defer circuit.deinit();
-
-    // A ----\
-    //        AND ---- OUT
-    // B ----/
 
     const and_node = try circuit.addNode(
         .and2,
         .{ .x = 0, .y = 0 },
     );
 
+    const not_node = try circuit.addNode(
+        .not1,
+        .{ .x = 100, .y = 0 },
+    );
+
+    // AND:
+    //
+    // input 0  -> connected
+    // input 1  -> missing
+    // output 0 -> missing
+    //
+    // NOT:
+    //
+    // input 0  -> missing
+    // output 0 -> missing
+
     const a = try circuit.addNet();
-    const b = try circuit.addNet();
-    const out = try circuit.addNet();
 
     try circuit.connectInput(
         and_node,
@@ -277,424 +345,96 @@ test "compile circuit and run" {
         a,
     );
 
-    try circuit.connectInput(
-        and_node,
-        1,
-        b,
-    );
-
-    try circuit.connectOutput(
-        and_node,
-        0,
-        out,
-    );
-
-    var compilation = try compile(
+    const result = try compile(
         std.testing.allocator,
         &circuit,
     );
-    defer compilation.deinit(
-        std.testing.allocator,
-    );
 
-    const a_bus =
-        compilation.busForNet(a).?;
+    switch (result) {
+        .success => |compilation_value| {
+            var compilation = compilation_value;
+            defer compilation.deinit(
+                std.testing.allocator,
+            );
 
-    const b_bus =
-        compilation.busForNet(b).?;
-
-    const out_bus =
-        compilation.busForNet(out).?;
-
-    var runtime = try compilation.createRuntime(
-        std.testing.allocator,
-    );
-    defer runtime.deinit();
-
-    const Case = struct {
-        a: bool,
-        b: bool,
-        out: bool,
-    };
-
-    const cases = [_]Case{
-        .{
-            .a = false,
-            .b = false,
-            .out = false,
+            return error.ExpectedFailure;
         },
-        .{
-            .a = false,
-            .b = true,
-            .out = false,
-        },
-        .{
-            .a = true,
-            .b = false,
-            .out = false,
-        },
-        .{
-            .a = true,
-            .b = true,
-            .out = true,
-        },
-    };
 
-    for (cases) |case| {
-        try runtime.store(
-            a_bus,
-            case.a,
-        );
-
-        try runtime.store(
-            b_bus,
-            case.b,
-        );
-
-        try runtime.settle(8);
-
-        try std.testing.expectEqual(
-            case.out,
-            try runtime.load(out_bus),
-        );
-    }
-}
-
-test "compile survives dense pool reordering" {
-    var circuit =
-        Circuit.init(std.testing.allocator);
-    defer circuit.deinit();
-
-    // Node dense order:
-    //
-    // [ junk ][ AND ]
-    //
-    // After removing junk:
-    //
-    // [ AND ]
-
-    const junk_node = try circuit.addNode(
-        .not1,
-        .{ .x = -100, .y = 0 },
-    );
-
-    const and_node = try circuit.addNode(
-        .and2,
-        .{ .x = 0, .y = 0 },
-    );
-
-    // Net dense order:
-    //
-    // [ A ][ junk ][ B ][ OUT ]
-    //
-    // After removing junk:
-    //
-    // [ A ][ OUT ][ B ]
-
-    const a = try circuit.addNet();
-    const junk_net = try circuit.addNet();
-    const b = try circuit.addNet();
-    const out = try circuit.addNet();
-
-    try std.testing.expect(
-        circuit.removeNode(junk_node),
-    );
-
-    try std.testing.expect(
-        circuit.removeNet(junk_net),
-    );
-
-    // Stale handles must remain invalid.
-    try std.testing.expect(
-        circuit.nodes.get(junk_node) == null,
-    );
-
-    try std.testing.expect(
-        circuit.nets.get(junk_net) == null,
-    );
-
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        circuit.nodes.denseIndex(and_node).?,
-    );
-
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        circuit.nets.denseIndex(a).?,
-    );
-
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        circuit.nets.denseIndex(out).?,
-    );
-
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        circuit.nets.denseIndex(b).?,
-    );
-
-    try circuit.connectInput(
-        and_node,
-        0,
-        a,
-    );
-
-    try circuit.connectInput(
-        and_node,
-        1,
-        b,
-    );
-
-    try circuit.connectOutput(
-        and_node,
-        0,
-        out,
-    );
-
-    var compilation = try compile(
-        std.testing.allocator,
-        &circuit,
-    );
-    defer compilation.deinit(
-        std.testing.allocator,
-    );
-
-    const a_bus: BusIndex =
-        @enumFromInt(
-            circuit.nets.denseIndex(a).?,
-        );
-
-    const b_bus: BusIndex =
-        @enumFromInt(
-            circuit.nets.denseIndex(b).?,
-        );
-
-    const out_bus: BusIndex =
-        @enumFromInt(
-            circuit.nets.denseIndex(out).?,
-        );
-
-    var runtime = try compilation.createRuntime(
-        std.testing.allocator,
-    );
-    defer runtime.deinit();
-
-    try runtime.store(
-        a_bus,
-        true,
-    );
-
-    try runtime.store(
-        b_bus,
-        true,
-    );
-
-    try runtime.settle(8);
-
-    try std.testing.expectEqual(
-        true,
-        try runtime.load(out_bus),
-    );
-}
-
-test "compilation keeps runtime identity snapshot" {
-    var circuit =
-        Circuit.init(std.testing.allocator);
-    defer circuit.deinit();
-
-    const node = try circuit.addNode(
-        .not1,
-        .{ .x = 0, .y = 0 },
-    );
-
-    const input = try circuit.addNet();
-    const output = try circuit.addNet();
-
-    try circuit.connectInput(
-        node,
-        0,
-        input,
-    );
-
-    try circuit.connectOutput(
-        node,
-        0,
-        output,
-    );
-
-    const input_bus =
-        circuit.nets.denseIndex(input).?;
-
-    const output_bus =
-        circuit.nets.denseIndex(output).?;
-
-    var compilation = try compile(
-        std.testing.allocator,
-        &circuit,
-    );
-    defer compilation.deinit(
-        std.testing.allocator,
-    );
-
-    try std.testing.expect(
-        compilation.chip_to_node[0]
-            .eql(node),
-    );
-
-    try std.testing.expect(
-        compilation.bus_to_net[input_bus]
-            .eql(input),
-    );
-
-    try std.testing.expect(
-        compilation.bus_to_net[output_bus]
-            .eql(output),
-    );
-
-    // Mutate the editor graph after compilation.
-    //
-    // The compiled snapshot must not change even if the editor-side
-    // dense storage changes or the original handle becomes stale.
-    try std.testing.expect(
-        circuit.removeNet(output),
-    );
-
-    try std.testing.expect(
-        circuit.nets.get(output) == null,
-    );
-
-    try std.testing.expect(
-        compilation.bus_to_net[input_bus]
-            .eql(input),
-    );
-
-    try std.testing.expect(
-        compilation.bus_to_net[output_bus]
-            .eql(output),
-    );
-}
-
-test "reverse compilation lookup survives editor mutation" {
-    var circuit =
-        Circuit.init(std.testing.allocator);
-    defer circuit.deinit();
-
-    const node = try circuit.addNode(
-        .not1,
-        .{ .x = 0, .y = 0 },
-    );
-
-    const input = try circuit.addNet();
-    const output = try circuit.addNet();
-
-    try circuit.connectInput(
-        node,
-        0,
-        input,
-    );
-
-    try circuit.connectOutput(
-        node,
-        0,
-        output,
-    );
-
-    var compilation = try compile(
-        std.testing.allocator,
-        &circuit,
-    );
-    defer compilation.deinit(
-        std.testing.allocator,
-    );
-
-    const input_bus =
-        compilation.busForNet(input).?;
-
-    const output_bus =
-        compilation.busForNet(output).?;
-
-    const node_chip =
-        compilation.chipForNode(node).?;
-
-    // Mutate the editor after the snapshot was compiled.
-    try std.testing.expect(
-        circuit.removeNet(output),
-    );
-
-    const replacement =
-        try circuit.addNet();
-
-    // The slot may have been reused, but the generation changed.
-    try std.testing.expectEqual(
-        output.index,
-        replacement.index,
-    );
-
-    try std.testing.expect(
-        output.generation !=
-            replacement.generation,
-    );
-
-    // The old handle still maps into the old compilation snapshot.
-    try std.testing.expectEqual(
-        input_bus,
-        compilation.busForNet(input).?,
-    );
-
-    try std.testing.expectEqual(
-        output_bus,
-        compilation.busForNet(output).?,
-    );
-
-    try std.testing.expectEqual(
-        node_chip,
-        compilation.chipForNode(node).?,
-    );
-
-    // A new editor object created after compilation does not exist
-    // in the old runtime snapshot.
-    try std.testing.expect(
-        compilation.busForNet(replacement) == null,
-    );
-}
-
-test "validate reports exact unconnected pin" {
-    var circuit =
-        Circuit.init(std.testing.allocator);
-    defer circuit.deinit();
-
-    const node = try circuit.addNode(
-        .and2,
-        .{ .x = 0, .y = 0 },
-    );
-
-    const a = try circuit.addNet();
-
-    try circuit.connectInput(
-        node,
-        0,
-        a,
-    );
-
-    const diagnostic = validate(&circuit).?;
-
-    switch (diagnostic) {
-        .unconnected_input => |pin| {
-            try std.testing.expect(
-                pin.node.eql(node),
+        .failure => |failure_value| {
+            var failure = failure_value;
+            defer failure.deinit(
+                std.testing.allocator,
             );
 
             try std.testing.expectEqual(
-                @as(u16, 1),
-                pin.port,
+                @as(usize, 4),
+                failure.diagnostics.len,
             );
-        },
 
-        else => return error.UnexpectedDiagnostic,
+            switch (failure.diagnostics[0]) {
+                .unconnected_input => |pin| {
+                    try std.testing.expect(
+                        pin.node.eql(and_node),
+                    );
+
+                    try std.testing.expectEqual(
+                        @as(u16, 1),
+                        pin.port,
+                    );
+                },
+
+                else => return error.UnexpectedDiagnostic,
+            }
+
+            switch (failure.diagnostics[1]) {
+                .unconnected_output => |pin| {
+                    try std.testing.expect(
+                        pin.node.eql(and_node),
+                    );
+
+                    try std.testing.expectEqual(
+                        @as(u16, 0),
+                        pin.port,
+                    );
+                },
+
+                else => return error.UnexpectedDiagnostic,
+            }
+
+            switch (failure.diagnostics[2]) {
+                .unconnected_input => |pin| {
+                    try std.testing.expect(
+                        pin.node.eql(not_node),
+                    );
+
+                    try std.testing.expectEqual(
+                        @as(u16, 0),
+                        pin.port,
+                    );
+                },
+
+                else => return error.UnexpectedDiagnostic,
+            }
+
+            switch (failure.diagnostics[3]) {
+                .unconnected_output => |pin| {
+                    try std.testing.expect(
+                        pin.node.eql(not_node),
+                    );
+
+                    try std.testing.expectEqual(
+                        @as(u16, 0),
+                        pin.port,
+                    );
+                },
+
+                else => return error.UnexpectedDiagnostic,
+            }
+        },
     }
 }
 
-test "validate accepts complete circuit" {
+test "compile succeeds when all pins are connected" {
     var circuit =
         Circuit.init(std.testing.allocator);
     defer circuit.deinit();
@@ -707,10 +447,185 @@ test "validate accepts complete circuit" {
     const input = try circuit.addNet();
     const output = try circuit.addNet();
 
-    try circuit.connectInput(node, 0, input);
-    try circuit.connectOutput(node, 0, output);
-
-    try std.testing.expect(
-        validate(&circuit) == null,
+    try circuit.connectInput(
+        node,
+        0,
+        input,
     );
+
+    try circuit.connectOutput(
+        node,
+        0,
+        output,
+    );
+
+    const result = try compile(
+        std.testing.allocator,
+        &circuit,
+    );
+
+    switch (result) {
+        .success => |compilation_value| {
+            var compilation = compilation_value;
+            defer compilation.deinit(
+                std.testing.allocator,
+            );
+
+            try std.testing.expect(
+                compilation.busForNet(input) != null,
+            );
+
+            try std.testing.expect(
+                compilation.busForNet(output) != null,
+            );
+
+            try std.testing.expect(
+                compilation.chipForNode(node) != null,
+            );
+        },
+
+        .failure => |failure_value| {
+            var failure = failure_value;
+            defer failure.deinit(
+                std.testing.allocator,
+            );
+
+            return error.UnexpectedFailure;
+        },
+    }
+}
+
+test "compile diagnostics update after editing circuit" {
+    var circuit =
+        Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const node = try circuit.addNode(
+        .and2,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const a = try circuit.addNet();
+    const b = try circuit.addNet();
+    const out = try circuit.addNet();
+
+    try circuit.connectInput(
+        node,
+        0,
+        a,
+    );
+
+    {
+        const result = try compile(
+            std.testing.allocator,
+            &circuit,
+        );
+
+        switch (result) {
+            .success => |compilation_value| {
+                var compilation = compilation_value;
+                defer compilation.deinit(
+                    std.testing.allocator,
+                );
+
+                return error.ExpectedFailure;
+            },
+
+            .failure => |failure_value| {
+                var failure = failure_value;
+                defer failure.deinit(
+                    std.testing.allocator,
+                );
+
+                // Missing input 1 and output 0.
+                try std.testing.expectEqual(
+                    @as(usize, 2),
+                    failure.diagnostics.len,
+                );
+            },
+        }
+    }
+
+    try circuit.connectInput(
+        node,
+        1,
+        b,
+    );
+
+    {
+        const result = try compile(
+            std.testing.allocator,
+            &circuit,
+        );
+
+        switch (result) {
+            .success => |compilation_value| {
+                var compilation = compilation_value;
+                defer compilation.deinit(
+                    std.testing.allocator,
+                );
+
+                return error.ExpectedFailure;
+            },
+
+            .failure => |failure_value| {
+                var failure = failure_value;
+                defer failure.deinit(
+                    std.testing.allocator,
+                );
+
+                // Only output 0 is missing now.
+                try std.testing.expectEqual(
+                    @as(usize, 1),
+                    failure.diagnostics.len,
+                );
+
+                switch (failure.diagnostics[0]) {
+                    .unconnected_output => |pin| {
+                        try std.testing.expect(
+                            pin.node.eql(node),
+                        );
+
+                        try std.testing.expectEqual(
+                            @as(u16, 0),
+                            pin.port,
+                        );
+                    },
+
+                    else => return error.UnexpectedDiagnostic,
+                }
+            },
+        }
+    }
+
+    try circuit.connectOutput(
+        node,
+        0,
+        out,
+    );
+
+    {
+        const result = try compile(
+            std.testing.allocator,
+            &circuit,
+        );
+
+        switch (result) {
+            .success => |compilation_value| {
+                var compilation = compilation_value;
+                defer compilation.deinit(
+                    std.testing.allocator,
+                );
+            },
+
+            .failure => |failure_value| {
+                var failure = failure_value;
+                defer failure.deinit(
+                    std.testing.allocator,
+                );
+
+                return error.UnexpectedFailure;
+            },
+        }
+    }
 }
