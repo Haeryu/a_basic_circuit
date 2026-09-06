@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Circuit = @import("Circuit.zig");
 const CompiledCircuit = @import("CompiledCircuit.zig");
+const Project = @import("Project.zig");
 
 const BusIndex = CompiledCircuit.BusIndex;
 const ChipSpec = CompiledCircuit.ChipSpec;
@@ -346,6 +347,27 @@ pub fn compile(allocator: std.mem.Allocator, circuit: *const Circuit) !CompileRe
             .output_buses = output_buses,
         },
     };
+}
+
+fn countPrimitiveNodes(project: *const Project, circuit_id: Circuit.Id) !usize {
+    const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
+
+    var count: usize = 0;
+    for (circuit.nodes.values.items) |node| {
+        switch (node.kind) {
+            .primitive => {
+                count = std.math.add(usize, count, 1) catch return error.TopologyTooLarge;
+            },
+            .subcircuit => |child_id| {
+                const child_count = try countPrimitiveNodes(project, child_id);
+
+                count = std.math.add(usize, count, child_count) catch
+                    return error.TopologyTooLarge;
+            },
+        }
+    }
+
+    return count;
 }
 
 fn compileSuccess(
@@ -1464,5 +1486,52 @@ test "primitive node stores kind and pin layout" {
     try std.testing.expectEqual(
         @as(usize, 3),
         node.connections.len,
+    );
+}
+
+test "compiler counts primitive nodes through hierarchy" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id = try project.addCircuit();
+    const parent_id = try project.addCircuit();
+
+    {
+        const child = project.get(child_id).?;
+
+        _ = try child.addNode(
+            .not1,
+            .{ .x = 0, .y = 0 },
+        );
+
+        _ = try child.addNode(
+            .and2,
+            .{ .x = 100, .y = 0 },
+        );
+    }
+
+    {
+        const child = project.getConst(child_id).?;
+        const parent = project.get(parent_id).?;
+
+        _ = try parent.addNode(
+            .xor2,
+            .{ .x = 0, .y = 0 },
+        );
+
+        _ = try parent.addSubcircuitNode(
+            child_id,
+            child,
+            .{ .x = 100, .y = 0 },
+        );
+    }
+
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        try countPrimitiveNodes(
+            &project,
+            parent_id,
+        ),
     );
 }

@@ -93,3 +93,57 @@ test "project keeps circuit handles stable" {
         project.get(d) != null,
     );
 }
+
+test "circuit may contain subcircuit node" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id = try project.addCircuit();
+    const parent_id = try project.addCircuit();
+
+    const child = project.get(child_id).?;
+
+    const child_input = try child.addNet();
+    const child_output = try child.addNet();
+
+    _ = try child.addInput(child_input);
+    _ = try child.addOutput(child_output);
+
+    const parent = project.get(parent_id).?;
+
+    const node_id = try parent.addSubcircuitNode(
+        child_id,
+        child,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const node = parent.nodes.get(node_id).?;
+
+    switch (node.kind) {
+        .subcircuit => |id| {
+            try std.testing.expect(
+                id.eql(child_id),
+            );
+        },
+
+        .primitive => {
+            return error.UnexpectedNodeKind;
+        },
+    }
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        node.inputCount(),
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        node.outputCount(),
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        node.connections.len,
+    );
+}

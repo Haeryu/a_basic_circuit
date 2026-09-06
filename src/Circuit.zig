@@ -383,6 +383,37 @@ pub fn removeOutput(self: *Circuit, index: usize) bool {
     return true;
 }
 
+pub fn addSubcircuitNode(
+    self: *Circuit,
+    circuit_id: Circuit.Id,
+    child: *const Circuit,
+    position: Vec2,
+) !NodeId {
+    const input_count = child.inputs.items.len;
+    const output_count = child.outputs.items.len;
+
+    if (input_count > std.math.maxInt(u16) or output_count > std.math.maxInt(u16)) {
+        return error.TooManyPins;
+    }
+
+    const connection_count = std.math.add(usize, input_count, output_count) catch
+        return error.TooManyPins;
+
+    const connections = try self.gpa.alloc(?NetId, connection_count);
+    errdefer self.gpa.free(connections);
+
+    @memset(connections, null);
+
+    return self.nodes.create(self.gpa, .{
+        .kind = .{
+            .subcircuit = circuit_id,
+        },
+        .position = position,
+        .input_count = @intCast(input_count),
+        .connections = connections,
+    });
+}
+
 test "circuit fanout survives node deletion" {
     var circuit = Circuit.init(std.testing.allocator);
     defer circuit.deinit();
