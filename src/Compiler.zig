@@ -15,6 +15,53 @@ const ReverseEntry = packed struct(u64) {
     runtime_index: u32 = 0,
 };
 
+pub const PinDiagnostic = struct {
+    node: Circuit.NodeId,
+    port: u16,
+};
+
+pub const Diagnostic = union(enum) {
+    unconnected_input: PinDiagnostic,
+    unconnected_output: PinDiagnostic,
+};
+
+pub fn validate(circuit: *const Circuit) ?Diagnostic {
+    for (circuit.nodes.values.items, 0..) |node, dense_index| {
+        const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
+
+        const input_count = node.op.inputCount();
+        const output_count = node.op.outputCount();
+
+        for (0..input_count) |port| {
+            if (node.connections[port] != null) {
+                continue;
+            }
+
+            return .{
+                .unconnected_input = .{
+                    .node = node_id,
+                    .port = @intCast(port),
+                },
+            };
+        }
+
+        for (0..output_count) |port| {
+            if (node.connections[input_count + port] != null) {
+                continue;
+            }
+
+            return .{
+                .unconnected_output = .{
+                    .node = node_id,
+                    .port = @intCast(port),
+                },
+            };
+        }
+    }
+
+    return null;
+}
+
 pub const Compilation = struct {
     topology: Topology,
 
@@ -608,5 +655,62 @@ test "reverse compilation lookup survives editor mutation" {
     // in the old runtime snapshot.
     try std.testing.expect(
         compilation.busForNet(replacement) == null,
+    );
+}
+
+test "validate reports exact unconnected pin" {
+    var circuit =
+        Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const node = try circuit.addNode(
+        .and2,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const a = try circuit.addNet();
+
+    try circuit.connectInput(
+        node,
+        0,
+        a,
+    );
+
+    const diagnostic = validate(&circuit).?;
+
+    switch (diagnostic) {
+        .unconnected_input => |pin| {
+            try std.testing.expect(
+                pin.node.eql(node),
+            );
+
+            try std.testing.expectEqual(
+                @as(u16, 1),
+                pin.port,
+            );
+        },
+
+        else => return error.UnexpectedDiagnostic,
+    }
+}
+
+test "validate accepts complete circuit" {
+    var circuit =
+        Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const node = try circuit.addNode(
+        .not1,
+        .{ .x = 0, .y = 0 },
+    );
+
+    const input = try circuit.addNet();
+    const output = try circuit.addNet();
+
+    try circuit.connectInput(node, 0, input);
+    try circuit.connectOutput(node, 0, output);
+
+    try std.testing.expect(
+        validate(&circuit) == null,
     );
 }
