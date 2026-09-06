@@ -132,8 +132,7 @@ pub const Topology = struct {
                 inputs[input_cursor] = bus_index;
 
                 input_cursor += 1;
-                const bus: usize =
-                    @intCast(@intFromEnum(bus_index));
+                const bus: usize = @intCast(@intFromEnum(bus_index));
 
                 consumer_offsets[bus + 1] += 1;
             }
@@ -540,4 +539,156 @@ test "compiled and" {
             ),
         );
     }
+}
+
+test "propagates across delta rounds" {
+    var topology = try Topology.init(
+        std.testing.allocator,
+        5,
+        &.{
+            .{
+                .op = .and2,
+                .inputs = &.{
+                    @enumFromInt(0), // A
+                    @enumFromInt(1), // B
+                },
+                .output = @enumFromInt(3), // MID
+            },
+            .{
+                .op = .and2,
+                .inputs = &.{
+                    @enumFromInt(3), // MID
+                    @enumFromInt(2), // C
+                },
+                .output = @enumFromInt(4), // OUT
+            },
+        },
+    );
+    errdefer topology.deinit(std.testing.allocator);
+
+    var circuit = try CompiledCircuit.init(
+        std.testing.allocator,
+        &topology,
+    );
+    defer circuit.deinit();
+
+    try circuit.store(@enumFromInt(0), true);
+    try circuit.store(@enumFromInt(1), true);
+    try circuit.store(@enumFromInt(2), true);
+
+    try std.testing.expectError(
+        error.UnstableCircuit,
+        circuit.settle(1),
+    );
+
+    // Round 1:
+    // AND0 sees A=B=1 -> stages MID=1
+    // AND1 still sees old MID=0.
+    try std.testing.expectEqual(
+        false,
+        try circuit.load(@enumFromInt(4)),
+    );
+
+    // Pending work must have survived the round limit.
+    try circuit.settle(1);
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(3)),
+    );
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(4)),
+    );
+}
+
+test "fanout wakes all consumers" {
+    var topology = try Topology.init(
+        std.testing.allocator,
+        7,
+        &.{
+            .{
+                .op = .and2,
+                .inputs = &.{
+                    @enumFromInt(0), // A
+                    @enumFromInt(1), // B
+                },
+                .output = @enumFromInt(4), // MID
+            },
+            .{
+                .op = .and2,
+                .inputs = &.{
+                    @enumFromInt(4), // MID
+                    @enumFromInt(2), // C
+                },
+                .output = @enumFromInt(5), // OUT0
+            },
+            .{
+                .op = .and2,
+                .inputs = &.{
+                    @enumFromInt(4), // MID
+                    @enumFromInt(3), // D
+                },
+                .output = @enumFromInt(6), // OUT1
+            },
+        },
+    );
+    errdefer topology.deinit(std.testing.allocator);
+
+    var circuit = try CompiledCircuit.init(
+        std.testing.allocator,
+        &topology,
+    );
+    defer circuit.deinit();
+
+    try circuit.store(@enumFromInt(0), true);
+    try circuit.store(@enumFromInt(1), true);
+    try circuit.store(@enumFromInt(2), true);
+    try circuit.store(@enumFromInt(3), true);
+
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(4)),
+    );
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(5)),
+    );
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(6)),
+    );
+}
+
+test "combinational oscillator does not settle" {
+    var topology = try Topology.init(
+        std.testing.allocator,
+        1,
+        &.{
+            .{
+                .op = .not1,
+                .inputs = &.{
+                    @enumFromInt(0),
+                },
+                .output = @enumFromInt(0),
+            },
+        },
+    );
+    errdefer topology.deinit(std.testing.allocator);
+
+    var circuit = try CompiledCircuit.init(
+        std.testing.allocator,
+        &topology,
+    );
+    defer circuit.deinit();
+
+    try std.testing.expectError(
+        error.UnstableCircuit,
+        circuit.settle(16),
+    );
 }
