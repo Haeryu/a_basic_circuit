@@ -51,9 +51,17 @@ const HierarchyPinDiagnostic = struct {
     port: u16,
 };
 
+const HierarchyNetDiagnostic = struct {
+    circuit: Circuit.Id,
+    net: Circuit.NetId,
+};
+
 const HierarchyDiagnostic = union(enum) {
     unconnected_input: HierarchyPinDiagnostic,
     unconnected_output: HierarchyPinDiagnostic,
+
+    undriven_net: HierarchyNetDiagnostic,
+    driven_input: HierarchyNetDiagnostic,
 };
 
 pub const PinDiagnostic = struct {
@@ -761,7 +769,7 @@ fn validateHierarchyRecursive(
     }
 }
 
-fn validateHierarchyPins(
+fn validateHierarchyDiagnostics(
     allocator: std.mem.Allocator,
     project: *const Project,
     circuit_id: Circuit.Id,
@@ -777,6 +785,28 @@ fn validateHierarchyPins(
     }
 
     visited.set(slot);
+
+    const bus_count = circuit.nets.values.items.len;
+    const external_inputs = try allocator.alloc(bool, bus_count);
+    defer allocator.free(external_inputs);
+
+    @memset(external_inputs, false);
+
+    const external_outputs = try allocator.alloc(bool, bus_count);
+    defer allocator.free(external_outputs);
+
+    @memset(external_outputs, false);
+    for (circuit.inputs.items) |port| {
+        const dense_index = circuit.nets.denseIndex(port.net) orelse unreachable;
+
+        external_inputs[dense_index] = true;
+    }
+
+    for (circuit.outputs.items) |port| {
+        const dense_index = circuit.nets.denseIndex(port.net) orelse unreachable;
+
+        external_outputs[dense_index] = true;
+    }
 
     for (circuit.nodes.values.items, 0..) |node, dense_index| {
         const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
@@ -810,11 +840,40 @@ fn validateHierarchyPins(
                 },
             });
         }
+    }
 
+    for (circuit.nets.values.items, 0..) |net, dense_index| {
+        const net_id = circuit.nets.handleAtDenseIndex(dense_index) orelse unreachable;
+        const is_input = external_inputs[dense_index];
+        const is_output = external_outputs[dense_index];
+
+        if (is_input and net.driver != null) {
+            try diagnostics.append(allocator, .{
+                .driven_input = .{
+                    .circuit = circuit_id,
+                    .net = net_id,
+                },
+            });
+
+            continue;
+        }
+
+        if (net.driver == null and !is_input and (net.consumers.items.len != 0 or is_output)) {
+            try diagnostics.append(allocator, .{
+                .undriven_net = .{
+                    .circuit = circuit_id,
+                    .net = net_id,
+                },
+            });
+        }
+    }
+
+    for (circuit.nodes.values.items) |node| {
         switch (node.kind) {
             .primitive => {},
+
             .subcircuit => |child_id| {
-                try validateHierarchyPins(
+                try validateHierarchyDiagnostics(
                     allocator,
                     project,
                     child_id,
@@ -3103,7 +3162,7 @@ test "hierarchy validation finds unconnected pin in child" {
         std.testing.allocator,
     );
 
-    try validateHierarchyPins(
+    try validateHierarchyDiagnostics(
         std.testing.allocator,
         &project,
         root_id,
@@ -3148,6 +3207,111 @@ test "hierarchy validation finds unconnected pin in child" {
             try std.testing.expectEqual(
                 @as(u16, 0),
                 pin.port,
+            );
+        },
+
+        else => return error.UnexpectedDiagnostic,
+    }
+}
+
+test "hierarchy validation finds undriven net in child" {
+    var project =
+        Project.init(std.testing.allocator);
+    defer project.deinit();
+
+    const child_id =
+        try project.addCircuit();
+
+    const root_id =
+        try project.addCircuit();
+
+    var input_net: Circuit.NetId =
+        undefined;
+
+    {
+        const child =
+            project.get(child_id).?;
+
+        input_net = try child.addNet();
+        const output = try child.addNet();
+
+        const node = try child.addNode(
+            .not1,
+            .{ .x = 0, .y = 0 },
+        );
+
+        try child.connectInput(
+            node,
+            0,
+            input_net,
+        );
+
+        try child.connectOutput(
+            node,
+            0,
+            output,
+        );
+
+        _ = try child.addOutput(output);
+    }
+
+    {
+        const child =
+            project.getConst(child_id).?;
+
+        const root =
+            project.get(root_id).?;
+
+        _ = try root.addSubcircuitNode(
+            child_id,
+            child,
+            .{ .x = 0, .y = 0 },
+        );
+    }
+
+    var visited =
+        try std.bit_set.DynamicBitSetUnmanaged.initEmpty(
+            std.testing.allocator,
+            project.circuits.slots.items.len,
+        );
+    defer visited.deinit(
+        std.testing.allocator,
+    );
+
+    var diagnostics: std.ArrayListUnmanaged(HierarchyDiagnostic) =
+        .empty;
+    defer diagnostics.deinit(
+        std.testing.allocator,
+    );
+
+    try validateHierarchyDiagnostics(
+        std.testing.allocator,
+        &project,
+        root_id,
+        &visited,
+        &diagnostics,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        diagnostics.items.len,
+    );
+
+    // Root instance has one unconnected output.
+    // Child contributes one undriven net.
+
+    switch (diagnostics.items[1]) {
+        .undriven_net => |diagnostic| {
+            try std.testing.expect(
+                diagnostic.circuit.eql(
+                    child_id,
+                ),
+            );
+
+            try std.testing.expect(
+                diagnostic.net.eql(
+                    input_net,
+                ),
             );
         },
 
