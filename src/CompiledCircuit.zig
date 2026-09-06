@@ -2,26 +2,13 @@ const CompiledCircuit = @This();
 
 const std = @import("std");
 
+const Op = @import("op.zig").Op;
+
 pub const BusIndex = enum(u32) {
     _,
 };
 pub const ChipIndex = enum(u32) {
     _,
-};
-
-pub const Op = enum(u8) {
-    and2,
-    or2,
-    xor2,
-    not1,
-    dff,
-
-    pub fn inputCount(self: Op) usize {
-        return switch (self) {
-            .and2, .or2, .xor2, .dff => 2,
-            .not1 => 1,
-        };
-    }
 };
 
 const RunFn = *const fn (circuit: *CompiledCircuit, chip: ChipIndex) void;

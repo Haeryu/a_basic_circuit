@@ -4,6 +4,7 @@ const std = @import("std");
 
 const DenseGenPool = @import("dense_gen_pool.zig").DenseGenPool;
 const GenHandle = @import("dense_gen_pool.zig").GenHandle;
+const Op = @import("op.zig").Op;
 
 const NodeTag = enum {};
 const NetTag = enum {};
@@ -27,9 +28,8 @@ pub const OutputPin = struct {
 };
 
 pub const Node = struct {
+    op: Op,
     position: Vec2,
-
-    input_count: u16,
 
     // [ inputs ][ outputs ]
     connections: []?NetId,
@@ -45,14 +45,14 @@ pub const Net = struct {
 const NodePool = DenseGenPool(Node, NodeId);
 const NetPool = DenseGenPool(Net, NetId);
 
-allocator: std.mem.Allocator,
+gpa: std.mem.Allocator,
 
 nodes: NodePool,
 nets: NetPool,
 
-pub fn init(allocator: std.mem.Allocator) Circuit {
+pub fn init(gpa: std.mem.Allocator) Circuit {
     return .{
-        .allocator = allocator,
+        .gpa = gpa,
         .nodes = .init,
         .nets = .init,
     };
@@ -60,20 +60,23 @@ pub fn init(allocator: std.mem.Allocator) Circuit {
 
 pub fn deinit(self: *Circuit) void {
     for (self.nodes.values.items) |node| {
-        self.allocator.free(node.connections);
+        self.gpa.free(node.connections);
     }
 
     for (self.nets.values.items) |*net| {
-        net.consumers.deinit(self.allocator);
+        net.consumers.deinit(self.gpa);
     }
 
-    self.nets.deinit(self.allocator);
-    self.nodes.deinit(self.allocator);
+    self.nets.deinit(self.gpa);
+    self.nodes.deinit(self.gpa);
 
     self.* = undefined;
 }
 
-pub fn addNode(self: *Circuit, input_count: usize, output_count: usize, position: Vec2) !NodeId {
+pub fn addNode(self: *Circuit, op: Op, position: Vec2) !NodeId {
+    const input_count = op.inputCount();
+    const output_count = op.outputCount();
+
     if (input_count > std.math.maxInt(u16) or output_count > std.math.maxInt(u16)) {
         return error.TooManyPins;
     }
@@ -82,21 +85,21 @@ pub fn addNode(self: *Circuit, input_count: usize, output_count: usize, position
         return error.TooManyPins;
     };
 
-    const connections = try self.allocator.alloc(?NetId, total);
-    errdefer self.allocator.free(connections);
+    const connections = try self.gpa.alloc(?NetId, total);
+    errdefer self.gpa.free(connections);
 
     @memset(connections, null);
 
-    return self.nodes.create(self.allocator, .{
+    return self.nodes.create(self.gpa, .{
+        .op = op,
         .position = position,
-        .input_count = @intCast(input_count),
         .connections = connections,
     });
 }
 
 pub fn removeNode(self: *Circuit, node_id: NodeId) bool {
     const node = self.nodes.get(node_id) orelse return false;
-    const input_count: usize = node.input_count;
+    const input_count = node.op.inputCount();
     const output_count = node.connections.len - input_count;
 
     for (0..input_count) |port| {
@@ -109,13 +112,13 @@ pub fn removeNode(self: *Circuit, node_id: NodeId) bool {
 
     const node_after_disconnect = self.nodes.get(node_id) orelse unreachable;
 
-    self.allocator.free(node_after_disconnect.connections);
+    self.gpa.free(node_after_disconnect.connections);
 
     return self.nodes.destroy(node_id);
 }
 
 pub fn addNet(self: *Circuit) !NetId {
-    return self.nets.create(self.allocator, .{});
+    return self.nets.create(self.gpa, .{});
 }
 
 pub fn removeNet(self: *Circuit, net_id: NetId) bool {
@@ -123,7 +126,7 @@ pub fn removeNet(self: *Circuit, net_id: NetId) bool {
 
     if (net.driver) |driver| {
         const node = self.nodes.get(driver.node) orelse unreachable;
-        const index = @as(usize, node.input_count) + @as(usize, driver.port);
+        const index = @as(usize, node.op.inputCount()) + @as(usize, driver.port);
 
         std.debug.assert(index < node.connections.len);
         std.debug.assert(node.connections[index].?.eql(net_id));
@@ -136,13 +139,13 @@ pub fn removeNet(self: *Circuit, net_id: NetId) bool {
 
         const port: usize = consumer.port;
 
-        std.debug.assert(port < node.input_count);
+        std.debug.assert(port < node.op.inputCount());
         std.debug.assert(node.connections[port].?.eql(net_id));
 
         node.connections[port] = null;
     }
 
-    net.consumers.deinit(self.allocator);
+    net.consumers.deinit(self.gpa);
 
     return self.nets.destroy(net_id);
 }
@@ -150,7 +153,7 @@ pub fn removeNet(self: *Circuit, net_id: NetId) bool {
 pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
     const node = self.nodes.get(node_id) orelse return error.InvalidNode;
 
-    if (port >= node.input_count) {
+    if (port >= node.op.inputCount()) {
         return error.InvalidPort;
     }
 
@@ -162,7 +165,7 @@ pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId)
         }
     }
 
-    try net.consumers.ensureUnusedCapacity(self.allocator, 1);
+    try net.consumers.ensureUnusedCapacity(self.gpa, 1);
 
     if (node.connections[port]) |old_net_id| {
         const old_net = self.nets.get(old_net_id) orelse unreachable;
@@ -190,7 +193,7 @@ pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId)
 pub fn disconnectInput(self: *Circuit, node_id: NodeId, port: usize) void {
     const node = self.nodes.get(node_id) orelse return;
 
-    if (port >= node.input_count) {
+    if (port >= node.op.inputCount()) {
         return;
     }
 
@@ -213,7 +216,7 @@ pub fn disconnectInput(self: *Circuit, node_id: NodeId, port: usize) void {
 pub fn connectOutput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
     const node = self.nodes.get(node_id) orelse return error.InvalidNode;
 
-    const input_count: usize = node.input_count;
+    const input_count = node.op.inputCount();
     const output_count = node.connections.len - input_count;
 
     if (port >= output_count) {
@@ -256,7 +259,7 @@ pub fn connectOutput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId
 
 pub fn disconnectOutput(self: *Circuit, node_id: NodeId, port: usize) void {
     const node = self.nodes.get(node_id) orelse return;
-    const input_count: usize = node.input_count;
+    const input_count = node.op.inputCount();
     const output_count = node.connections.len - input_count;
 
     if (port >= output_count) {
@@ -277,25 +280,25 @@ pub fn disconnectOutput(self: *Circuit, node_id: NodeId, port: usize) void {
 }
 
 test "circuit fanout survives node deletion" {
-    var circuit =
-        Circuit.init(std.testing.allocator);
+    var circuit = Circuit.init(std.testing.allocator);
     defer circuit.deinit();
 
+    //
+    // source.OUT ── net ─┬─> a.IN
+    //                    └─> b.IN
+
     const source = try circuit.addNode(
-        0,
-        1,
+        .not1,
         .{ .x = 0, .y = 0 },
     );
 
     const a = try circuit.addNode(
-        1,
-        0,
+        .not1,
         .{ .x = 100, .y = -50 },
     );
 
     const b = try circuit.addNode(
-        1,
-        0,
+        .not1,
         .{ .x = 100, .y = 50 },
     );
 
@@ -357,11 +360,17 @@ test "circuit fanout survives node deletion" {
         circuit.nets.get(net) == null,
     );
 
+    // source output disconnected.
+    //
+    // NOT:
+    // connections[0] = input
+    // connections[1] = output
     try std.testing.expect(
         circuit.nodes.get(source).?
-            .connections[0] == null,
+            .connections[1] == null,
     );
 
+    // b input disconnected.
     try std.testing.expect(
         circuit.nodes.get(b).?
             .connections[0] == null,

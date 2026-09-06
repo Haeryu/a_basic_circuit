@@ -48,24 +48,24 @@ pub fn DenseGenPool(comptime T: type, comptime HandleType: type) type {
             .free_head = end,
         };
 
-        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            self.value_slots.deinit(allocator);
-            self.values.deinit(allocator);
-            self.slots.deinit(allocator);
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            self.value_slots.deinit(gpa);
+            self.values.deinit(gpa);
+            self.slots.deinit(gpa);
 
             self.* = undefined;
         }
 
-        pub fn create(self: *Self, allocator: std.mem.Allocator, value: T) !Handle {
-            try self.values.ensureUnusedCapacity(allocator, 1);
-            try self.value_slots.ensureUnusedCapacity(allocator, 1);
+        pub fn create(self: *Self, gpa: std.mem.Allocator, value: T) !Handle {
+            try self.values.ensureUnusedCapacity(gpa, 1);
+            try self.value_slots.ensureUnusedCapacity(gpa, 1);
 
             if (self.free_head == end) {
                 if (self.slots.items.len >= end) {
                     return error.TooManySlots;
                 }
 
-                try self.slots.ensureUnusedCapacity(allocator, 1);
+                try self.slots.ensureUnusedCapacity(gpa, 1);
             }
 
             const dense_index: u32 = @intCast(self.values.items.len);
