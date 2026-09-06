@@ -14,10 +14,11 @@ pub const Op = enum(u8) {
     or2,
     xor2,
     not1,
+    dff,
 
     pub fn inputCount(self: Op) usize {
         return switch (self) {
-            .and2, .or2, .xor2 => 2,
+            .and2, .or2, .xor2, .dff => 2,
             .not1 => 1,
         };
     }
@@ -30,6 +31,7 @@ const pfnRuns = [_]RunFn{
     &runOr2,
     &runXor2,
     &runNot1,
+    &runDff,
 };
 
 pub const ChipSpec = struct {
@@ -206,15 +208,12 @@ next_dirty: []ChipIndex,
 current_dirty_count: usize,
 next_dirty_count: usize,
 
-pub fn init(
-    allocator: std.mem.Allocator,
-    topology: *Topology,
-) !CompiledCircuit {
-    var owned = topology.*;
-    topology.* = undefined;
-    errdefer owned.deinit(allocator);
+dff_prev_clock: std.bit_set.DynamicBitSetUnmanaged,
+dff_initialized: std.bit_set.DynamicBitSetUnmanaged,
 
-    const bus_count = owned.consumer_offsets.len - 1;
+pub fn init(allocator: std.mem.Allocator, topology: *Topology) !CompiledCircuit {
+    const bus_count = topology.consumer_offsets.len - 1;
+    const chip_count = topology.ops.len;
 
     var values: std.bit_set.DynamicBitSetUnmanaged = try .initEmpty(allocator, bus_count);
     errdefer values.deinit(allocator);
@@ -225,30 +224,40 @@ pub fn init(
     var pending: std.bit_set.DynamicBitSetUnmanaged = try .initEmpty(allocator, bus_count);
     errdefer pending.deinit(allocator);
 
-    var dirty: std.bit_set.DynamicBitSetUnmanaged = try .initFull(allocator, owned.ops.len);
+    var dirty: std.bit_set.DynamicBitSetUnmanaged = try .initFull(allocator, chip_count);
     errdefer dirty.deinit(allocator);
 
-    const current_dirty = try allocator.alloc(ChipIndex, owned.ops.len);
+    const current_dirty = try allocator.alloc(ChipIndex, chip_count);
     errdefer allocator.free(current_dirty);
 
-    const next_dirty = try allocator.alloc(ChipIndex, owned.ops.len);
+    const next_dirty = try allocator.alloc(ChipIndex, chip_count);
     errdefer allocator.free(next_dirty);
 
     for (current_dirty, 0..) |*slot, i| {
         slot.* = @enumFromInt(i);
     }
 
+    var dff_prev_clock: std.bit_set.DynamicBitSetUnmanaged =
+        try .initEmpty(allocator, chip_count);
+    errdefer dff_prev_clock.deinit(allocator);
+
+    var dff_initialized: std.bit_set.DynamicBitSetUnmanaged =
+        try .initEmpty(allocator, chip_count);
+    errdefer dff_initialized.deinit(allocator);
+
+    defer topology.* = undefined;
+
     return .{
         .allocator = allocator,
 
-        .ops = owned.ops,
+        .ops = topology.ops,
 
-        .input_starts = owned.input_starts,
-        .inputs = owned.inputs,
-        .outputs = owned.outputs,
+        .input_starts = topology.input_starts,
+        .inputs = topology.inputs,
+        .outputs = topology.outputs,
 
-        .consumer_offsets = owned.consumer_offsets,
-        .consumers = owned.consumers,
+        .consumer_offsets = topology.consumer_offsets,
+        .consumers = topology.consumers,
 
         .values = values,
         .next_values = next_values,
@@ -258,13 +267,19 @@ pub fn init(
         .current_dirty = current_dirty,
         .next_dirty = next_dirty,
 
-        .current_dirty_count = owned.ops.len,
+        .current_dirty_count = chip_count,
         .next_dirty_count = 0,
+
+        .dff_prev_clock = dff_prev_clock,
+        .dff_initialized = dff_initialized,
     };
 }
 
 pub fn deinit(self: *CompiledCircuit) void {
     const allocator = self.allocator;
+
+    self.dff_initialized.deinit(allocator);
+    self.dff_prev_clock.deinit(allocator);
 
     allocator.free(self.next_dirty);
     allocator.free(self.current_dirty);
@@ -447,6 +462,33 @@ fn runNot1(self: *CompiledCircuit, chip_index: ChipIndex) void {
     const out: usize = @intCast(@intFromEnum(self.outputs[chip]));
 
     self.next_values.setValue(out, !self.values.isSet(input));
+
+    self.pending.set(out);
+}
+
+fn runDff(self: *CompiledCircuit, chip_index: ChipIndex) void {
+    const chip: usize = @intCast(@intFromEnum(chip_index));
+    const input_start: usize = @intCast(self.input_starts[chip]);
+
+    const d: usize = @intCast(@intFromEnum(self.inputs[input_start]));
+    const clk: usize = @intCast(@intFromEnum(self.inputs[input_start + 1]));
+    const out: usize = @intCast(@intFromEnum(self.outputs[chip]));
+    const clock = self.values.isSet(clk);
+
+    if (!self.dff_initialized.isSet(chip)) {
+        self.dff_initialized.set(chip);
+        self.dff_prev_clock.setValue(chip, clock);
+        return;
+    }
+
+    const prev_clock = self.dff_prev_clock.isSet(chip);
+    self.dff_prev_clock.setValue(chip, clock);
+
+    if (prev_clock or !clock) {
+        return;
+    }
+
+    self.next_values.setValue(out, self.values.isSet(d));
 
     self.pending.set(out);
 }
@@ -690,5 +732,98 @@ test "combinational oscillator does not settle" {
     try std.testing.expectError(
         error.UnstableCircuit,
         circuit.settle(16),
+    );
+}
+
+test "dff samples only on rising edge" {
+    // bus 0 = D
+    // bus 1 = CLK
+    // bus 2 = Q
+
+    var topology = try Topology.init(
+        std.testing.allocator,
+        3,
+        &.{
+            .{
+                .op = .dff,
+                .inputs = &.{
+                    @enumFromInt(0),
+                    @enumFromInt(1),
+                },
+                .output = @enumFromInt(2),
+            },
+        },
+    );
+    errdefer topology.deinit(
+        std.testing.allocator,
+    );
+
+    var circuit = try CompiledCircuit.init(
+        std.testing.allocator,
+        &topology,
+    );
+    defer circuit.deinit();
+
+    // Initial evaluation establishes CLK=0.
+    try circuit.settle(8);
+
+    // D = 1, but clock remains low.
+    try circuit.store(
+        @enumFromInt(0),
+        true,
+    );
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        false,
+        try circuit.load(@enumFromInt(2)),
+    );
+
+    // Rising edge.
+    try circuit.store(
+        @enumFromInt(1),
+        true,
+    );
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(2)),
+    );
+
+    // Change D while CLK is still high.
+    try circuit.store(
+        @enumFromInt(0),
+        false,
+    );
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(2)),
+    );
+
+    // Falling edge.
+    try circuit.store(
+        @enumFromInt(1),
+        false,
+    );
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        true,
+        try circuit.load(@enumFromInt(2)),
+    );
+
+    // Next rising edge samples D=0.
+    try circuit.store(
+        @enumFromInt(1),
+        true,
+    );
+    try circuit.settle(8);
+
+    try std.testing.expectEqual(
+        false,
+        try circuit.load(@enumFromInt(2)),
     );
 }
