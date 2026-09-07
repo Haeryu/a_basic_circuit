@@ -123,7 +123,7 @@ test "circuit may contain subcircuit node" {
     switch (node.kind) {
         .subcircuit => |id| {
             try std.testing.expect(
-                id.eql(child_id),
+                id == child_id,
             );
         },
 
@@ -134,7 +134,7 @@ test "circuit may contain subcircuit node" {
 
     try std.testing.expectEqual(
         @as(usize, 1),
-        node.inputCount(),
+        node.input_count,
     );
 
     try std.testing.expectEqual(

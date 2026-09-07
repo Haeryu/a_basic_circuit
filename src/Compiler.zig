@@ -318,7 +318,7 @@ fn countPrimitiveInputs(project: *const Project, circuit_id: Circuit.Id) !usize 
     for (circuit.nodes.values.items) |node| {
         switch (node.kind) {
             .primitive => {
-                count = std.math.add(usize, count, node.inputCount()) catch
+                count = std.math.add(usize, count, node.input_count) catch
                     return error.TopologyTooLarge;
             },
             .subcircuit => |child_id| {
@@ -340,7 +340,7 @@ fn makeChildBusMap(
     parent_bus_map: []const BusIndex,
     aliases: *BusAliases,
 ) ![]BusIndex {
-    std.debug.assert(parent_node.inputCount() == child.inputs.items.len);
+    std.debug.assert(parent_node.input_count == child.inputs.items.len);
     std.debug.assert(parent_node.outputCount() == child.outputs.items.len);
 
     const bus_map = try allocator.alloc(BusIndex, child.nets.values.items.len);
@@ -357,7 +357,7 @@ fn makeChildBusMap(
         bus_map[child_dense] = parent_bus_map[parent_dense];
     }
 
-    const output_start = parent_node.inputCount();
+    const output_start = parent_node.input_count;
 
     for (child.outputs.items, 0..) |port, i| {
         const child_dense = child.nets.denseIndex(port.net) orelse unreachable;
@@ -431,7 +431,7 @@ fn emitCircuit(
 
         switch (node.kind) {
             .primitive => |op| {
-                const input_count = node.inputCount();
+                const input_count = node.input_count;
 
                 if (node.outputCount() != 1) {
                     return error.UnsupportedOutputCount;
@@ -553,7 +553,7 @@ fn validateHierarchyRecursive(
             .subcircuit => |child_id| {
                 const child = project.getConst(child_id) orelse return error.InvalidCircuit;
 
-                if (node.inputCount() != child.inputs.items.len or
+                if (node.input_count != child.inputs.items.len or
                     node.outputCount() != child.outputs.items.len)
                 {
                     return error.SubcircuitInterfaceChanged;
@@ -605,7 +605,7 @@ fn validateDiagnostics(
 
     for (circuit.nodes.values.items, 0..) |node, dense_index| {
         const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
-        const input_count = node.inputCount();
+        const input_count = node.input_count;
         const output_count = node.outputCount();
 
         for (0..input_count) |port| {
@@ -1025,15 +1025,13 @@ test "compile returns diagnostics from child circuit" {
             switch (failure.diagnostics[0]) {
                 .unconnected_input => |pin| {
                     try std.testing.expect(
-                        pin.circuit.eql(
+                        pin.circuit ==
                             child_id,
-                        ),
                     );
 
                     try std.testing.expect(
-                        pin.node.eql(
+                        pin.node ==
                             child_node,
-                        ),
                     );
 
                     try std.testing.expectEqual(
@@ -1048,15 +1046,13 @@ test "compile returns diagnostics from child circuit" {
             switch (failure.diagnostics[1]) {
                 .unconnected_output => |pin| {
                     try std.testing.expect(
-                        pin.circuit.eql(
+                        pin.circuit ==
                             child_id,
-                        ),
                     );
 
                     try std.testing.expect(
-                        pin.node.eql(
+                        pin.node ==
                             child_node,
-                        ),
                     );
 
                     try std.testing.expectEqual(
@@ -1144,15 +1140,13 @@ test "compile reports undriven net" {
             switch (failure.diagnostics[0]) {
                 .undriven_net => |diagnostic| {
                     try std.testing.expect(
-                        diagnostic.circuit.eql(
+                        diagnostic.circuit ==
                             root_id,
-                        ),
                     );
 
                     try std.testing.expect(
-                        diagnostic.net.eql(
+                        diagnostic.net ==
                             input_net,
-                        ),
                     );
                 },
 
@@ -1236,15 +1230,13 @@ test "compile reports driven input" {
             switch (failure.diagnostics[0]) {
                 .driven_input => |diagnostic| {
                     try std.testing.expect(
-                        diagnostic.circuit.eql(
+                        diagnostic.circuit ==
                             root_id,
-                        ),
                     );
 
                     try std.testing.expect(
-                        diagnostic.net.eql(
+                        diagnostic.net ==
                             driven_input,
-                        ),
                     );
                 },
 
@@ -2063,19 +2055,19 @@ test "chip origins distinguish repeated nested instances" {
         compilation.chip_origins[1];
 
     try std.testing.expect(
-        first.circuit.eql(leaf_id),
+        first.circuit == leaf_id,
     );
 
     try std.testing.expect(
-        second.circuit.eql(leaf_id),
+        second.circuit == leaf_id,
     );
 
     try std.testing.expect(
-        first.node.eql(leaf_node),
+        first.node == leaf_node,
     );
 
     try std.testing.expect(
-        second.node.eql(leaf_node),
+        second.node == leaf_node,
     );
 
     try std.testing.expectEqual(
@@ -2101,35 +2093,35 @@ test "chip origins distinguish repeated nested instances" {
         compilation.origin_path[second_start .. second_start + second.path_len];
 
     try std.testing.expect(
-        first_path[0].circuit.eql(root_id),
+        first_path[0].circuit == root_id,
     );
 
     try std.testing.expect(
-        first_path[0].node.eql(first_instance),
+        first_path[0].node == first_instance,
     );
 
     try std.testing.expect(
-        first_path[1].circuit.eql(middle_id),
+        first_path[1].circuit == middle_id,
     );
 
     try std.testing.expect(
-        first_path[1].node.eql(leaf_instance),
+        first_path[1].node == leaf_instance,
     );
 
     try std.testing.expect(
-        second_path[0].circuit.eql(root_id),
+        second_path[0].circuit == root_id,
     );
 
     try std.testing.expect(
-        second_path[0].node.eql(second_instance),
+        second_path[0].node == second_instance,
     );
 
     try std.testing.expect(
-        second_path[1].circuit.eql(middle_id),
+        second_path[1].circuit == middle_id,
     );
 
     try std.testing.expect(
-        second_path[1].node.eql(leaf_instance),
+        second_path[1].node == leaf_instance,
     );
 }
 
@@ -2279,11 +2271,11 @@ test "net origins distinguish repeated subcircuit instances" {
     var found_count: usize = 0;
 
     for (compilation.net_origins) |origin| {
-        if (!origin.circuit.eql(child_id)) {
+        if (!(origin.circuit == child_id)) {
             continue;
         }
 
-        if (!origin.net.eql(middle_net)) {
+        if (!(origin.net == middle_net)) {
             continue;
         }
 
@@ -2327,18 +2319,18 @@ test "net origins distinguish repeated subcircuit instances" {
         compilation.origin_path[second_start .. second_start + 1];
 
     try std.testing.expect(
-        first_path[0].circuit.eql(root_id),
+        first_path[0].circuit == root_id,
     );
 
     try std.testing.expect(
-        second_path[0].circuit.eql(root_id),
+        second_path[0].circuit == root_id,
     );
 
     const first_is_first =
-        first_path[0].node.eql(first_instance);
+        first_path[0].node == first_instance;
 
     const first_is_second =
-        first_path[0].node.eql(second_instance);
+        first_path[0].node == second_instance;
 
     try std.testing.expect(
         first_is_first or first_is_second,
@@ -2346,11 +2338,11 @@ test "net origins distinguish repeated subcircuit instances" {
 
     if (first_is_first) {
         try std.testing.expect(
-            second_path[0].node.eql(second_instance),
+            second_path[0].node == second_instance,
         );
     } else {
         try std.testing.expect(
-            second_path[0].node.eql(first_instance),
+            second_path[0].node == first_instance,
         );
     }
 }

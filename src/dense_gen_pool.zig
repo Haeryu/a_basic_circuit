@@ -8,11 +8,11 @@ pub fn GenHandle(comptime Tag: type) type {
         reserved: u1 = 0,
         index: u32,
 
-        pub fn eql(self: @This(), other: @This()) bool {
-            return self.generation == other.generation and
-                self.index == other.index and
-                self.reserved == other.reserved;
-        }
+        // pub fn eql(self: @This(), other: @This()) bool {
+        //     return self.generation == other.generation and
+        //         self.index == other.index and
+        //         self.reserved == other.reserved;
+        // }
     };
 }
 
