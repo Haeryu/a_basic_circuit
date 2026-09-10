@@ -60,7 +60,7 @@ pub const NetOrigin = struct {
 };
 
 pub const Compilation = struct {
-    topology: Topology,
+    runtime: CompiledCircuit,
 
     input_buses: []BusIndex,
     output_buses: []BusIndex,
@@ -69,12 +69,8 @@ pub const Compilation = struct {
     net_origins: []NetOrigin,
     origin_path: []InstancePathEntry,
 
-    topology_owned: bool = true,
-
     pub fn deinit(self: *Compilation, allocator: std.mem.Allocator) void {
-        if (self.topology_owned) {
-            self.topology.deinit(allocator);
-        }
+        self.runtime.deinit();
 
         allocator.free(self.origin_path);
         allocator.free(self.net_origins);
@@ -85,16 +81,6 @@ pub const Compilation = struct {
 
         self.* = undefined;
     }
-
-    pub fn createRuntime(self: *Compilation, allocator: std.mem.Allocator) !CompiledCircuit {
-        std.debug.assert(self.topology_owned);
-
-        const runtime: CompiledCircuit = try .init(allocator, &self.topology);
-
-        self.topology_owned = false;
-
-        return runtime;
-    }
 };
 
 pub const CompileResult = union(enum) {
@@ -104,11 +90,6 @@ pub const CompileResult = union(enum) {
 
 const BusAliases = struct {
     parents: std.ArrayListUnmanaged(u32) = .empty,
-
-    fn deinit(self: *BusAliases, allocator: std.mem.Allocator) void {
-        self.parents.deinit(allocator);
-        self.* = undefined;
-    }
 
     fn add(self: *BusAliases, allocator: std.mem.Allocator) !BusIndex {
         if (self.parents.items.len >= std.math.maxInt(u32)) {
@@ -158,411 +139,264 @@ pub fn compile(
     project: *const Project,
     root_id: Circuit.Id,
 ) !CompileResult {
-    try validateHierarchy(allocator, project, root_id);
+    var build: Build = .{
+        .allocator = allocator,
+        .project = project,
+        .scratch = .init(allocator),
+    };
+    defer build.deinit();
+    const scratch = build.scratch.allocator();
 
+    const counts = try validateHierarchy(scratch, project, root_id);
     const root = project.getConst(root_id) orelse return error.InvalidCircuit;
-
     var visited: std.bit_set.DynamicBitSetUnmanaged = try .initEmpty(
-        allocator,
+        scratch,
         project.circuits.slots.items.len,
     );
-    defer visited.deinit(allocator);
-
     var diagnostics: std.ArrayListUnmanaged(Diagnostic) = .empty;
-    defer diagnostics.deinit(allocator);
-
-    try validateDiagnostics(allocator, project, root_id, &visited, &diagnostics);
+    try validateDiagnostics(scratch, project, root_id, &visited, &diagnostics);
 
     if (diagnostics.items.len != 0) {
-        return .{
-            .failure = .{
-                .diagnostics = try diagnostics.toOwnedSlice(allocator),
-            },
-        };
+        return .{ .failure = .{
+            .diagnostics = try allocator.dupe(Diagnostic, diagnostics.items),
+        } };
     }
 
-    const chip_count = try countPrimitiveNodes(project, root_id);
-    const input_count = try countPrimitiveInputs(project, root_id);
-
-    const chip_specs = try allocator.alloc(ChipSpec, chip_count);
-    defer allocator.free(chip_specs);
-
-    const inputs = try allocator.alloc(BusIndex, input_count);
-    defer allocator.free(inputs);
-
-    const chip_origins = try allocator.alloc(ChipOrigin, chip_count);
-    errdefer allocator.free(chip_origins);
-
-    var net_origins: std.ArrayListUnmanaged(NetOrigin) = .empty;
-    defer net_origins.deinit(allocator);
-
-    var origin_path: std.ArrayListUnmanaged(InstancePathEntry) = .empty;
-    defer origin_path.deinit(allocator);
-
-    var path: std.ArrayListUnmanaged(InstancePathEntry) = .empty;
-    defer path.deinit(allocator);
+    try build.chips.ensureTotalCapacityPrecise(allocator, counts.chips);
+    try build.inputs.ensureTotalCapacityPrecise(allocator, counts.inputs);
+    try build.chip_origins.ensureTotalCapacityPrecise(allocator, counts.chips);
+    try build.net_origins.ensureTotalCapacityPrecise(allocator, counts.nets);
 
     const root_bus_count = root.nets.values.items.len;
+    if (root_bus_count > std.math.maxInt(u32)) return error.TopologyTooLarge;
+    const root_bus_map = try scratch.alloc(BusIndex, root_bus_count);
+    for (root_bus_map) |*bus| bus.* = try build.aliases.add(allocator);
 
-    if (root_bus_count > std.math.maxInt(u32)) {
-        return error.TopologyTooLarge;
+    try build.emitCircuit(root_id, root_bus_map);
+    return .{ .success = try build.finish(root, root_bus_map) };
+}
+
+// Scratch holds validation data and temporary bus maps. Output lists transfer
+// ownership to Compilation. Inputs are reserved once before emission and only
+// appended within that capacity, so ChipSpec input slices remain valid.
+const Build = struct {
+    allocator: std.mem.Allocator,
+    project: *const Project,
+    scratch: std.heap.ArenaAllocator,
+    chips: std.ArrayListUnmanaged(ChipSpec) = .empty,
+    inputs: std.ArrayListUnmanaged(BusIndex) = .empty,
+    aliases: BusAliases = .{},
+    path: std.ArrayListUnmanaged(InstancePathEntry) = .empty,
+
+    chip_origins: std.ArrayListUnmanaged(ChipOrigin) = .empty,
+    net_origins: std.ArrayListUnmanaged(NetOrigin) = .empty,
+    origin_path: std.ArrayListUnmanaged(InstancePathEntry) = .empty,
+
+    fn deinit(self: *Build) void {
+        self.origin_path.deinit(self.allocator);
+        self.net_origins.deinit(self.allocator);
+        self.chip_origins.deinit(self.allocator);
+        self.path.deinit(self.allocator);
+        self.aliases.parents.deinit(self.allocator);
+        self.inputs.deinit(self.allocator);
+        self.chips.deinit(self.allocator);
+        self.scratch.deinit();
+        self.* = undefined;
     }
 
-    const root_bus_map = try allocator.alloc(BusIndex, root_bus_count);
-    defer allocator.free(root_bus_map);
+    fn emitCircuit(self: *Build, circuit_id: Circuit.Id, bus_map: []const BusIndex) !void {
+        const circuit = self.project.getConst(circuit_id) orelse return error.InvalidCircuit;
+        const scratch = self.scratch.allocator();
+        std.debug.assert(bus_map.len == circuit.nets.values.items.len);
 
-    var aliases: BusAliases = .{};
-    defer aliases.deinit(allocator);
+        // Every net and primitive in this instance uses the same path.
+        const path_end = std.math.add(usize, self.origin_path.items.len, self.path.items.len) catch
+            return error.TopologyTooLarge;
+        if (path_end > std.math.maxInt(u32)) return error.TopologyTooLarge;
+        const path_start: u32 = @intCast(self.origin_path.items.len);
+        const path_len: u32 = @intCast(self.path.items.len);
+        try self.origin_path.appendSlice(self.allocator, self.path.items);
 
-    for (root_bus_map) |*bus| {
-        bus.* = try aliases.add(allocator);
+        for (circuit.nets.values.items, 0..) |_, dense_index| {
+            self.net_origins.appendAssumeCapacity(.{
+                .path_start = path_start,
+                .path_len = path_len,
+                .circuit = circuit_id,
+                .net = circuit.nets.handleAtDenseIndex(dense_index) orelse unreachable,
+                .bus = bus_map[dense_index],
+            });
+        }
+
+        for (circuit.nodes.values.items, 0..) |node, dense_index| {
+            const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
+            switch (node.kind) {
+                .primitive => |op| {
+                    if (node.outputCount() != 1) return error.UnsupportedOutputCount;
+                    if (node.input_count != op.inputCount()) return error.InvalidArity;
+                    const input_end = std.math.add(usize, self.inputs.items.len, node.input_count) catch
+                        return error.TopologyTooLarge;
+                    if (input_end > std.math.maxInt(u32) or self.chips.items.len >= std.math.maxInt(u32))
+                        return error.TopologyTooLarge;
+                    const input_start: u32 = @intCast(self.inputs.items.len);
+                    for (node.connections[0..node.input_count]) |connection| {
+                        const dense_net = circuit.nets.denseIndex(connection.?) orelse unreachable;
+                        self.inputs.appendAssumeCapacity(bus_map[dense_net]);
+                    }
+                    const output_dense = circuit.nets.denseIndex(node.connections[node.input_count].?) orelse unreachable;
+                    self.chips.appendAssumeCapacity(.{
+                        .op = op,
+                        .inputs = self.inputs.items[input_start..input_end],
+                        .output = bus_map[output_dense],
+                    });
+                    self.chip_origins.appendAssumeCapacity(.{
+                        .path_start = path_start,
+                        .path_len = path_len,
+                        .circuit = circuit_id,
+                        .node = node_id,
+                    });
+                },
+                .subcircuit => |child_id| {
+                    const child = self.project.getConst(child_id) orelse return error.InvalidCircuit;
+                    const child_bus_map = try self.makeChildBusMap(child, &node, circuit, bus_map);
+                    defer scratch.free(child_bus_map);
+                    try self.path.append(self.allocator, .{ .circuit = circuit_id, .node = node_id });
+                    defer self.path.items.len -= 1;
+                    try self.emitCircuit(child_id, child_bus_map);
+                },
+            }
+        }
     }
 
-    var chip_cursor: usize = 0;
-    var input_cursor: usize = 0;
+    fn makeChildBusMap(
+        self: *Build,
+        child: *const Circuit,
+        parent_node: *const Circuit.Node,
+        parent: *const Circuit,
+        parent_bus_map: []const BusIndex,
+    ) ![]BusIndex {
+        const scratch = self.scratch.allocator();
+        const bus_map = try scratch.alloc(BusIndex, child.nets.values.items.len);
+        const invalid = std.math.maxInt(u32);
+        @memset(bus_map, @enumFromInt(invalid));
 
-    try emitCircuit(
-        allocator,
-        project,
-        root_id,
-        root_bus_map,
-        chip_specs,
-        inputs,
-        chip_origins,
-        &net_origins,
-        &origin_path,
-        &path,
-        &chip_cursor,
-        &input_cursor,
-        &aliases,
-    );
-
-    std.debug.assert(chip_cursor == chip_count);
-    std.debug.assert(input_cursor == input_count);
-
-    for (inputs) |*input| {
-        input.* = aliases.find(input.*);
+        for (child.inputs.items, 0..) |port, i| {
+            const child_dense = child.nets.denseIndex(port.net) orelse unreachable;
+            const parent_dense = parent.nets.denseIndex(parent_node.connections[i].?) orelse unreachable;
+            bus_map[child_dense] = parent_bus_map[parent_dense];
+        }
+        for (child.outputs.items, 0..) |port, i| {
+            const child_dense = child.nets.denseIndex(port.net) orelse unreachable;
+            const parent_dense = parent.nets.denseIndex(parent_node.connections[@as(usize, parent_node.input_count) + i].?) orelse unreachable;
+            if (@intFromEnum(bus_map[child_dense]) != invalid) {
+                self.aliases.merge(bus_map[child_dense], parent_bus_map[parent_dense]);
+            } else {
+                bus_map[child_dense] = parent_bus_map[parent_dense];
+            }
+        }
+        for (bus_map) |*bus| {
+            if (@intFromEnum(bus.*) == invalid) bus.* = try self.aliases.add(self.allocator);
+        }
+        return bus_map;
     }
 
-    for (chip_specs) |*chip| {
-        chip.output = aliases.find(chip.output);
-    }
+    fn finish(self: *Build, root: *const Circuit, root_bus_map: []const BusIndex) !Compilation {
+        const allocator = self.allocator;
+        for (self.inputs.items) |*input| input.* = self.aliases.find(input.*);
+        for (self.net_origins.items) |*origin| origin.bus = self.aliases.find(origin.bus);
 
-    for (net_origins.items) |*origin| {
-        origin.bus = aliases.find(origin.bus);
-    }
+        for (self.chips.items) |*chip| chip.output = self.aliases.find(chip.output);
 
-    const input_buses = try allocator.alloc(BusIndex, root.inputs.items.len);
-    errdefer allocator.free(input_buses);
+        const input_buses = try allocator.alloc(BusIndex, root.inputs.items.len);
+        errdefer allocator.free(input_buses);
+        const output_buses = try allocator.alloc(BusIndex, root.outputs.items.len);
+        errdefer allocator.free(output_buses);
+        for (root.inputs.items, input_buses) |port, *bus| {
+            bus.* = self.aliases.find(root_bus_map[root.nets.denseIndex(port.net).?]);
+        }
+        for (root.outputs.items, output_buses) |port, *bus| {
+            bus.* = self.aliases.find(root_bus_map[root.nets.denseIndex(port.net).?]);
+        }
 
-    const output_buses = try allocator.alloc(BusIndex, root.outputs.items.len);
-    errdefer allocator.free(output_buses);
+        const chip_origins = try self.chip_origins.toOwnedSlice(allocator);
+        errdefer allocator.free(chip_origins);
+        const net_origins = try self.net_origins.toOwnedSlice(allocator);
+        errdefer allocator.free(net_origins);
+        const origin_path = try self.origin_path.toOwnedSlice(allocator);
+        errdefer allocator.free(origin_path);
 
-    for (root.inputs.items, 0..) |port, i| {
-        const dense_index = root.nets.denseIndex(port.net) orelse unreachable;
-
-        input_buses[i] = aliases.find(root_bus_map[dense_index]);
-    }
-
-    for (root.outputs.items, 0..) |port, i| {
-        const dense_index = root.nets.denseIndex(port.net) orelse unreachable;
-
-        output_buses[i] = aliases.find(root_bus_map[dense_index]);
-    }
-
-    const owned_net_origins = try net_origins.toOwnedSlice(allocator);
-    errdefer allocator.free(owned_net_origins);
-
-    const owned_origin_path = try origin_path.toOwnedSlice(allocator);
-    errdefer allocator.free(owned_origin_path);
-
-    var topology: Topology = try .init(allocator, aliases.parents.items.len, chip_specs);
-    errdefer topology.deinit(allocator);
-
-    return .{
-        .success = .{
-            .topology = topology,
+        var topology = try Topology.init(allocator, self.aliases.parents.items.len, self.chips.items);
+        errdefer topology.deinit(allocator);
+        const runtime = try CompiledCircuit.init(allocator, &topology);
+        return .{
+            .runtime = runtime,
             .input_buses = input_buses,
             .output_buses = output_buses,
             .chip_origins = chip_origins,
-            .net_origins = owned_net_origins,
-            .origin_path = owned_origin_path,
-        },
-    };
-}
-
-fn countPrimitiveNodes(project: *const Project, circuit_id: Circuit.Id) !usize {
-    const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
-
-    var count: usize = 0;
-    for (circuit.nodes.values.items) |node| {
-        switch (node.kind) {
-            .primitive => {
-                count = std.math.add(usize, count, 1) catch return error.TopologyTooLarge;
-            },
-            .subcircuit => |child_id| {
-                const child_count = try countPrimitiveNodes(project, child_id);
-                count = std.math.add(usize, count, child_count) catch
-                    return error.TopologyTooLarge;
-            },
-        }
+            .net_origins = net_origins,
+            .origin_path = origin_path,
+        };
     }
+};
 
-    return count;
-}
+const Counts = struct {
+    chips: usize = 0,
+    inputs: usize = 0,
+    nets: usize = 0,
 
-fn countPrimitiveInputs(project: *const Project, circuit_id: Circuit.Id) !usize {
-    const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
-
-    var count: usize = 0;
-    for (circuit.nodes.values.items) |node| {
-        switch (node.kind) {
-            .primitive => {
-                count = std.math.add(usize, count, node.input_count) catch
-                    return error.TopologyTooLarge;
-            },
-            .subcircuit => |child_id| {
-                const child_count = try countPrimitiveInputs(project, child_id);
-                count = std.math.add(usize, count, child_count) catch
-                    return error.TopologyTooLarge;
-            },
-        }
-    }
-
-    return count;
-}
-
-fn makeChildBusMap(
-    allocator: std.mem.Allocator,
-    child: *const Circuit,
-    parent_node: *const Circuit.Node,
-    parent: *const Circuit,
-    parent_bus_map: []const BusIndex,
-    aliases: *BusAliases,
-) ![]BusIndex {
-    std.debug.assert(parent_node.input_count == child.inputs.items.len);
-    std.debug.assert(parent_node.outputCount() == child.outputs.items.len);
-
-    const bus_map = try allocator.alloc(BusIndex, child.nets.values.items.len);
-    errdefer allocator.free(bus_map);
-
-    const invalid = std.math.maxInt(u32);
-    @memset(bus_map, @enumFromInt(invalid));
-
-    for (child.inputs.items, 0..) |port, i| {
-        const child_dense = child.nets.denseIndex(port.net) orelse unreachable;
-        const parent_net = parent_node.connections[i] orelse unreachable;
-        const parent_dense = parent.nets.denseIndex(parent_net) orelse unreachable;
-
-        bus_map[child_dense] = parent_bus_map[parent_dense];
-    }
-
-    const output_start = parent_node.input_count;
-
-    for (child.outputs.items, 0..) |port, i| {
-        const child_dense = child.nets.denseIndex(port.net) orelse unreachable;
-        const parent_net = parent_node.connections[output_start + i] orelse unreachable;
-        const parent_dense = parent.nets.denseIndex(parent_net) orelse unreachable;
-
-        if (@intFromEnum(bus_map[child_dense]) != invalid) {
-            aliases.merge(bus_map[child_dense], parent_bus_map[parent_dense]);
-
-            continue;
-        }
-
-        bus_map[child_dense] = parent_bus_map[parent_dense];
-    }
-
-    for (bus_map) |*bus| {
-        if (@intFromEnum(bus.*) != invalid) {
-            continue;
-        }
-
-        bus.* = try aliases.add(allocator);
-    }
-
-    return bus_map;
-}
-
-fn emitCircuit(
-    allocator: std.mem.Allocator,
-    project: *const Project,
-    circuit_id: Circuit.Id,
-    bus_map: []const BusIndex,
-    chip_specs: []ChipSpec,
-    inputs: []BusIndex,
-    chip_origins: []ChipOrigin,
-    net_origins: *std.ArrayListUnmanaged(NetOrigin),
-    origin_path: *std.ArrayListUnmanaged(InstancePathEntry),
-    path: *std.ArrayListUnmanaged(InstancePathEntry),
-    chip_cursor: *usize,
-    input_cursor: *usize,
-    aliases: *BusAliases,
-) !void {
-    const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
-
-    std.debug.assert(bus_map.len == circuit.nets.values.items.len);
-    std.debug.assert(chip_origins.len == chip_specs.len);
-
-    for (circuit.nets.values.items, 0..) |_, dense_index| {
-        const net_id = circuit.nets.handleAtDenseIndex(dense_index) orelse unreachable;
-        const path_end = std.math.add(usize, origin_path.items.len, path.items.len) catch
+    fn add(self: *Counts, other: Counts) !void {
+        self.chips = std.math.add(usize, self.chips, other.chips) catch return error.TopologyTooLarge;
+        self.inputs = std.math.add(usize, self.inputs, other.inputs) catch return error.TopologyTooLarge;
+        self.nets = std.math.add(usize, self.nets, other.nets) catch return error.TopologyTooLarge;
+        if (self.chips > std.math.maxInt(u32) or self.inputs > std.math.maxInt(u32))
             return error.TopologyTooLarge;
-
-        if (path_end > std.math.maxInt(u32)) {
-            return error.TopologyTooLarge;
-        }
-
-        const path_start: u32 = @intCast(origin_path.items.len);
-        const path_len: u32 = @intCast(path.items.len);
-
-        try origin_path.appendSlice(allocator, path.items);
-        try net_origins.append(allocator, .{
-            .path_start = path_start,
-            .path_len = path_len,
-            .circuit = circuit_id,
-            .net = net_id,
-            .bus = bus_map[dense_index],
-        });
     }
+};
 
-    for (circuit.nodes.values.items, 0..) |node, dense_index| {
-        const node_id = circuit.nodes.handleAtDenseIndex(dense_index) orelse unreachable;
-
-        switch (node.kind) {
-            .primitive => |op| {
-                const input_count = node.input_count;
-
-                if (node.outputCount() != 1) {
-                    return error.UnsupportedOutputCount;
-                }
-
-                std.debug.assert(chip_cursor.* < chip_specs.len);
-                std.debug.assert(input_cursor.* + input_count <= inputs.len);
-
-                const input_start = input_cursor.*;
-                for (0..input_count) |port| {
-                    const net_id = node.connections[port] orelse unreachable;
-                    const dense_net_index = circuit.nets.denseIndex(net_id) orelse unreachable;
-
-                    inputs[input_start + port] = bus_map[dense_net_index];
-                }
-
-                const output_net = node.connections[input_count] orelse unreachable;
-                const output_dense = circuit.nets.denseIndex(output_net) orelse unreachable;
-
-                chip_specs[chip_cursor.*] = .{
-                    .op = op,
-                    .inputs = inputs[input_start .. input_start + input_count],
-                    .output = bus_map[output_dense],
-                };
-
-                const path_end = std.math.add(usize, origin_path.items.len, path.items.len) catch
-                    return error.TopologyTooLarge;
-
-                if (path_end > std.math.maxInt(u32)) {
-                    return error.TopologyTooLarge;
-                }
-
-                const path_start: u32 = @intCast(origin_path.items.len);
-                const path_len: u32 = @intCast(path.items.len);
-
-                try origin_path.appendSlice(allocator, path.items);
-
-                chip_origins[chip_cursor.*] = .{
-                    .path_start = path_start,
-                    .path_len = path_len,
-                    .circuit = circuit_id,
-                    .node = node_id,
-                };
-
-                chip_cursor.* += 1;
-                input_cursor.* += input_count;
-            },
-
-            .subcircuit => |child_id| {
-                const child = project.getConst(child_id) orelse return error.InvalidCircuit;
-                const child_bus_map = try makeChildBusMap(
-                    allocator,
-                    child,
-                    &node,
-                    circuit,
-                    bus_map,
-                    aliases,
-                );
-                defer allocator.free(child_bus_map);
-
-                try path.append(allocator, .{
-                    .circuit = circuit_id,
-                    .node = node_id,
-                });
-                defer path.items.len -= 1;
-
-                try emitCircuit(
-                    allocator,
-                    project,
-                    child_id,
-                    child_bus_map,
-                    chip_specs,
-                    inputs,
-                    chip_origins,
-                    net_origins,
-                    origin_path,
-                    path,
-                    chip_cursor,
-                    input_cursor,
-                    aliases,
-                );
-            },
-        }
-    }
-}
+const Definition = struct {
+    state: enum { unseen, active, complete } = .unseen,
+    counts: Counts = .{},
+};
 
 fn validateHierarchy(
     allocator: std.mem.Allocator,
     project: *const Project,
     root_id: Circuit.Id,
-) !void {
-    var active: std.bit_set.DynamicBitSetUnmanaged = try .initEmpty(
-        allocator,
-        project.circuits.slots.items.len,
-    );
-    defer active.deinit(allocator);
-
-    try validateHierarchyRecursive(project, root_id, &active);
+) !Counts {
+    const definitions = try allocator.alloc(Definition, project.circuits.slots.items.len);
+    defer allocator.free(definitions);
+    @memset(definitions, .{});
+    return validateHierarchyRecursive(project, root_id, definitions);
 }
 
 fn validateHierarchyRecursive(
     project: *const Project,
     circuit_id: Circuit.Id,
-    active: *std.bit_set.DynamicBitSetUnmanaged,
-) !void {
+    definitions: []Definition,
+) !Counts {
     const circuit = project.getConst(circuit_id) orelse return error.InvalidCircuit;
-    const slot: usize = @intCast(circuit_id.index);
-
-    if (active.isSet(slot)) {
-        return error.CircuitCycle;
+    const definition = &definitions[@intCast(circuit_id.index)];
+    switch (definition.state) {
+        .active => return error.CircuitCycle,
+        .complete => return definition.counts,
+        .unseen => {},
     }
-
-    active.set(slot);
-    defer active.unset(slot);
-
+    definition.state = .active;
+    var counts: Counts = .{ .nets = circuit.nets.values.items.len };
     for (circuit.nodes.values.items) |node| {
         switch (node.kind) {
-            .primitive => {},
+            .primitive => try counts.add(.{ .chips = 1, .inputs = node.input_count }),
             .subcircuit => |child_id| {
                 const child = project.getConst(child_id) orelse return error.InvalidCircuit;
-
+                // Check each instance, including references to a cached definition.
                 if (node.input_count != child.inputs.items.len or
                     node.outputCount() != child.outputs.items.len)
-                {
                     return error.SubcircuitInterfaceChanged;
-                }
-
-                try validateHierarchyRecursive(project, child_id, active);
+                try counts.add(try validateHierarchyRecursive(project, child_id, definitions));
             },
         }
     }
+    definition.* = .{ .state = .complete, .counts = counts };
+    return counts;
 }
 
 fn validateDiagnostics(
@@ -583,24 +417,25 @@ fn validateDiagnostics(
 
     const bus_count = circuit.nets.values.items.len;
 
-    const external_inputs = try allocator.alloc(bool, bus_count);
-    defer allocator.free(external_inputs);
-    @memset(external_inputs, false);
-
-    const external_outputs = try allocator.alloc(bool, bus_count);
-    defer allocator.free(external_outputs);
-    @memset(external_outputs, false);
+    const NetUse = packed struct {
+        is_input: bool = false,
+        is_output: bool = false,
+        consumed: bool = false,
+    };
+    const uses = try allocator.alloc(NetUse, bus_count);
+    defer allocator.free(uses);
+    @memset(uses, .{});
 
     for (circuit.inputs.items) |port| {
         const dense_index = circuit.nets.denseIndex(port.net) orelse unreachable;
 
-        external_inputs[dense_index] = true;
+        uses[dense_index].is_input = true;
     }
 
     for (circuit.outputs.items) |port| {
         const dense_index = circuit.nets.denseIndex(port.net) orelse unreachable;
 
-        external_outputs[dense_index] = true;
+        uses[dense_index].is_output = true;
     }
 
     for (circuit.nodes.values.items, 0..) |node, dense_index| {
@@ -609,7 +444,8 @@ fn validateDiagnostics(
         const output_count = node.outputCount();
 
         for (0..input_count) |port| {
-            if (node.connections[port] != null) {
+            if (node.connections[port]) |net_id| {
+                uses[circuit.nets.denseIndex(net_id).?].consumed = true;
                 continue;
             }
 
@@ -639,8 +475,8 @@ fn validateDiagnostics(
 
     for (circuit.nets.values.items, 0..) |net, dense_index| {
         const net_id = circuit.nets.handleAtDenseIndex(dense_index) orelse unreachable;
-        const is_input = external_inputs[dense_index];
-        const is_output = external_outputs[dense_index];
+        const is_input = uses[dense_index].is_input;
+        const is_output = uses[dense_index].is_output;
 
         if (is_input and net.driver != null) {
             try diagnostics.append(allocator, .{
@@ -653,7 +489,7 @@ fn validateDiagnostics(
             continue;
         }
 
-        if (net.driver == null and !is_input and (net.consumers.items.len != 0 or is_output)) {
+        if (net.driver == null and !is_input and (uses[dense_index].consumed or is_output)) {
             try diagnostics.append(allocator, .{
                 .undriven_net = .{
                     .circuit = circuit_id,
@@ -738,7 +574,7 @@ test "compile primitive circuit and run" {
 
     try std.testing.expectEqual(
         @as(usize, 1),
-        compilation.topology.ops.len,
+        compilation.runtime.topology.ops.len,
     );
 
     try std.testing.expectEqual(
@@ -751,11 +587,7 @@ test "compile primitive circuit and run" {
         compilation.output_buses.len,
     );
 
-    var runtime =
-        try compilation.createRuntime(
-            std.testing.allocator,
-        );
-    defer runtime.deinit();
+    const runtime = &compilation.runtime;
 
     const input_bus =
         compilation.input_buses[0];
@@ -917,14 +749,10 @@ test "compile nested subcircuits and run" {
 
     try std.testing.expectEqual(
         @as(usize, 1),
-        compilation.topology.ops.len,
+        compilation.runtime.topology.ops.len,
     );
 
-    var runtime =
-        try compilation.createRuntime(
-            std.testing.allocator,
-        );
-    defer runtime.deinit();
+    const runtime = &compilation.runtime;
 
     try runtime.store(
         compilation.input_buses[0],
@@ -1548,21 +1376,17 @@ test "subcircuit instances have independent internal buses" {
     // Each child contains two primitive NOT gates.
     try std.testing.expectEqual(
         @as(usize, 4),
-        compilation.topology.ops.len,
+        compilation.runtime.topology.ops.len,
     );
 
     // Root has four buses and each child instance
     // contributes one independent internal bus.
     try std.testing.expectEqual(
         @as(usize, 6),
-        compilation.topology.consumer_offsets.len - 1,
+        compilation.runtime.topology.consumer_offsets.len - 1,
     );
 
-    var runtime =
-        try compilation.createRuntime(
-            std.testing.allocator,
-        );
-    defer runtime.deinit();
+    const runtime = &compilation.runtime;
 
     const a =
         compilation.input_buses[0];
@@ -1676,7 +1500,7 @@ test "pass-through subcircuit aliases input and output" {
 
     try std.testing.expectEqual(
         @as(usize, 0),
-        compilation.topology.ops.len,
+        compilation.runtime.topology.ops.len,
     );
 
     try std.testing.expectEqual(
@@ -1684,11 +1508,7 @@ test "pass-through subcircuit aliases input and output" {
         compilation.output_buses[0],
     );
 
-    var runtime =
-        try compilation.createRuntime(
-            std.testing.allocator,
-        );
-    defer runtime.deinit();
+    const runtime = &compilation.runtime;
 
     try runtime.store(
         compilation.input_buses[0],
@@ -1843,14 +1663,10 @@ test "pass-through aliases primitive buses" {
 
     try std.testing.expectEqual(
         @as(usize, 1),
-        compilation.topology.ops.len,
+        compilation.runtime.topology.ops.len,
     );
 
-    var runtime =
-        try compilation.createRuntime(
-            std.testing.allocator,
-        );
-    defer runtime.deinit();
+    const runtime = &compilation.runtime;
 
     try runtime.store(
         compilation.input_buses[0],
@@ -2345,4 +2161,141 @@ test "net origins distinguish repeated subcircuit instances" {
             second_path[0].node == first_instance,
         );
     }
+}
+
+fn makeTestHierarchy(project: *Project, chain_length: usize) !struct { root: Circuit.Id, child: Circuit.Id } {
+    const child_id = try project.addCircuit();
+    {
+        const child = project.get(child_id).?;
+        var previous = try child.addNet();
+        _ = try child.addInput(previous);
+        for (0..chain_length) |_| {
+            const output = try child.addNet();
+            const node = try child.addNode(.not1, .{ .x = 0, .y = 0 });
+            try child.connectInput(node, 0, previous);
+            try child.connectOutput(node, 0, output);
+            previous = output;
+        }
+        _ = try child.addOutput(previous);
+    }
+    const root_id = try project.addCircuit();
+    const root = project.get(root_id).?;
+    for (0..2) |_| {
+        const input = try root.addNet();
+        const output = try root.addNet();
+        _ = try root.addInput(input);
+        _ = try root.addOutput(output);
+        const node = try root.addSubcircuitNode(child_id, project.getConst(child_id).?, .{ .x = 0, .y = 0 });
+        try root.connectInput(node, 0, input);
+        try root.connectOutput(node, 0, output);
+    }
+    return .{ .root = root_id, .child = child_id };
+}
+
+test "compilation owns its runtime after source edits and destruction" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = counted.allocator();
+    var compilation: Compilation = blk: {
+        var project = Project.init(std.testing.allocator);
+        defer project.deinit();
+        const fixture = try makeTestHierarchy(&project, 129);
+        const root = project.get(fixture.root).?;
+        const removed = try root.addNode(.not1, .{ .x = 0, .y = 0 });
+        const discarded_output = try root.addNet();
+        try root.connectInput(removed, 0, root.inputs.items[0].net);
+        try root.connectOutput(removed, 0, discarded_output);
+        try std.testing.expect(root.removeNode(removed));
+
+        var result = try compile(allocator, &project, fixture.root);
+        switch (result) {
+            .failure => |*failure| {
+                failure.deinit(allocator);
+                return error.UnexpectedDiagnostics;
+            },
+            .success => |success| {
+                const child = project.get(fixture.child).?;
+                _ = child.removeNet(child.inputs.items[0].net);
+                break :blk success;
+            },
+        }
+    };
+    defer compilation.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 258), compilation.chip_origins.len);
+    try std.testing.expectEqual(@as(usize, 2), compilation.origin_path.len);
+    for (compilation.chip_origins, 0..) |origin, i| {
+        try std.testing.expectEqual(@as(u32, 1), origin.path_len);
+        try std.testing.expectEqual(@as(u32, @intCast(i / 129)), origin.path_start);
+    }
+    for (compilation.net_origins) |origin| {
+        if (origin.path_len != 0) {
+            try std.testing.expect(origin.path_start < compilation.origin_path.len);
+            try std.testing.expectEqual(@as(u32, 1), origin.path_len);
+        }
+    }
+
+    // All runtime state is already allocated, even for hundreds of delta rounds.
+    counted.fail_index = counted.alloc_index;
+    counted.resize_fail_index = counted.resize_index;
+    try compilation.runtime.store(compilation.input_buses[0], true);
+    try compilation.runtime.settle(132);
+    try std.testing.expectEqual(false, try compilation.runtime.load(compilation.output_buses[0]));
+    try std.testing.expectEqual(true, try compilation.runtime.load(compilation.output_buses[1]));
+    try compilation.runtime.store(compilation.input_buses[0], false);
+    try compilation.runtime.store(compilation.input_buses[1], true);
+    try compilation.runtime.settle(132);
+    try std.testing.expectEqual(true, try compilation.runtime.load(compilation.output_buses[0]));
+    try std.testing.expectEqual(false, try compilation.runtime.load(compilation.output_buses[1]));
+    try std.testing.expect(!counted.has_induced_failure);
+}
+
+fn checkCompileAllocationCleanup(
+    allocator: std.mem.Allocator,
+    project: *const Project,
+    root: Circuit.Id,
+    expect_success: bool,
+) !void {
+    var result = try compile(allocator, project, root);
+    switch (result) {
+        .success => |*compilation| {
+            defer compilation.deinit(allocator);
+            try std.testing.expect(expect_success);
+        },
+        .failure => |*failure| {
+            defer failure.deinit(allocator);
+            try std.testing.expect(!expect_success);
+        },
+    }
+}
+
+test "compile releases every allocation on success and diagnostic allocation failures" {
+    var project = Project.init(std.testing.allocator);
+    defer project.deinit();
+    const fixture = try makeTestHierarchy(&project, 17);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCompileAllocationCleanup, .{ &project, fixture.root, true });
+
+    const child = project.get(fixture.child).?;
+    const first = child.nodes.handleAtDenseIndex(0).?;
+    child.disconnectInput(first, 0);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCompileAllocationCleanup, .{ &project, fixture.root, false });
+}
+
+test "cached hierarchy validation still checks every instance interface" {
+    var project = Project.init(std.testing.allocator);
+    defer project.deinit();
+    const fixture = try makeTestHierarchy(&project, 1);
+    project.get(fixture.root).?.nodes.values.items[1].input_count = 0;
+    try std.testing.expectError(error.SubcircuitInterfaceChanged, compile(std.testing.allocator, &project, fixture.root));
+}
+
+test "empty compilation owns a usable empty runtime" {
+    var project = Project.init(std.testing.allocator);
+    defer project.deinit();
+    const root = try project.addCircuit();
+    var compilation = try compileSuccess(&project, root);
+    defer compilation.deinit(std.testing.allocator);
+    try compilation.runtime.settle(0);
+    try std.testing.expectEqual(@as(usize, 0), compilation.chip_origins.len);
+    try std.testing.expectEqual(@as(usize, 0), compilation.net_origins.len);
+    try std.testing.expectError(error.InvalidBus, compilation.runtime.load(@enumFromInt(0)));
 }

@@ -11,16 +11,6 @@ pub const ChipIndex = enum(u32) {
     _,
 };
 
-const RunFn = *const fn (circuit: *CompiledCircuit, chip: ChipIndex) void;
-
-const pfnRuns = [_]RunFn{
-    &runAnd2,
-    &runOr2,
-    &runXor2,
-    &runNot1,
-    &runDff,
-};
-
 pub const ChipSpec = struct {
     op: Op,
     inputs: []const BusIndex,
@@ -123,26 +113,26 @@ pub const Topology = struct {
                 input_cursor += 1;
                 const bus: usize = @intCast(@intFromEnum(bus_index));
 
-                consumer_offsets[bus + 1] += 1;
+                consumer_offsets[bus] += 1;
             }
         }
 
-        // counts -> CSR offsets
-        for (0..bus_count) |bus| {
-            consumer_offsets[bus + 1] += consumer_offsets[bus];
+        // Counts -> end positions. Filling chips backwards decrements these
+        // positions into the final CSR starts, preserving ascending chip order.
+        var end: u32 = 0;
+        for (consumer_offsets[0..bus_count]) |*offset| {
+            end += offset.*;
+            offset.* = end;
         }
+        consumer_offsets[bus_count] = end;
 
-        const write_offsets = try allocator.dupe(u32, consumer_offsets[0..bus_count]);
-        defer allocator.free(write_offsets);
-
-        for (chips, 0..) |chip, chip_index| {
-            for (chip.inputs) |bus_index| {
+        var chip_index = chips.len;
+        while (chip_index != 0) {
+            chip_index -= 1;
+            for (chips[chip_index].inputs) |bus_index| {
                 const bus: usize = @intCast(@intFromEnum(bus_index));
-                const position: usize = @intCast(write_offsets[bus]);
-
-                consumers[position] = @enumFromInt(chip_index);
-
-                write_offsets[bus] += 1;
+                consumer_offsets[bus] -= 1;
+                consumers[consumer_offsets[bus]] = @enumFromInt(chip_index);
             }
         }
 
@@ -173,19 +163,9 @@ pub const Topology = struct {
 };
 
 allocator: std.mem.Allocator,
-
-ops: []Op,
-
-input_starts: []u32,
-inputs: []BusIndex,
-outputs: []BusIndex,
-
-consumer_offsets: []u32,
-consumers: []ChipIndex,
+topology: Topology,
 
 values: std.bit_set.DynamicBitSetUnmanaged,
-next_values: std.bit_set.DynamicBitSetUnmanaged,
-pending: std.bit_set.DynamicBitSetUnmanaged,
 
 dirty: std.bit_set.DynamicBitSetUnmanaged,
 
@@ -196,7 +176,7 @@ current_dirty_count: usize,
 next_dirty_count: usize,
 
 dff_prev_clock: std.bit_set.DynamicBitSetUnmanaged,
-dff_initialized: std.bit_set.DynamicBitSetUnmanaged,
+first_round: bool,
 
 pub fn init(allocator: std.mem.Allocator, topology: *Topology) !CompiledCircuit {
     const bus_count = topology.consumer_offsets.len - 1;
@@ -204,12 +184,6 @@ pub fn init(allocator: std.mem.Allocator, topology: *Topology) !CompiledCircuit 
 
     var values: std.bit_set.DynamicBitSetUnmanaged = try .initEmpty(allocator, bus_count);
     errdefer values.deinit(allocator);
-
-    var next_values: std.bit_set.DynamicBitSetUnmanaged = try .initEmpty(allocator, bus_count);
-    errdefer next_values.deinit(allocator);
-
-    var pending: std.bit_set.DynamicBitSetUnmanaged = try .initEmpty(allocator, bus_count);
-    errdefer pending.deinit(allocator);
 
     var dirty: std.bit_set.DynamicBitSetUnmanaged = try .initFull(allocator, chip_count);
     errdefer dirty.deinit(allocator);
@@ -228,27 +202,14 @@ pub fn init(allocator: std.mem.Allocator, topology: *Topology) !CompiledCircuit 
         try .initEmpty(allocator, chip_count);
     errdefer dff_prev_clock.deinit(allocator);
 
-    var dff_initialized: std.bit_set.DynamicBitSetUnmanaged =
-        try .initEmpty(allocator, chip_count);
-    errdefer dff_initialized.deinit(allocator);
-
     defer topology.* = undefined;
 
     return .{
         .allocator = allocator,
 
-        .ops = topology.ops,
-
-        .input_starts = topology.input_starts,
-        .inputs = topology.inputs,
-        .outputs = topology.outputs,
-
-        .consumer_offsets = topology.consumer_offsets,
-        .consumers = topology.consumers,
+        .topology = topology.*,
 
         .values = values,
-        .next_values = next_values,
-        .pending = pending,
         .dirty = dirty,
 
         .current_dirty = current_dirty,
@@ -258,14 +219,13 @@ pub fn init(allocator: std.mem.Allocator, topology: *Topology) !CompiledCircuit 
         .next_dirty_count = 0,
 
         .dff_prev_clock = dff_prev_clock,
-        .dff_initialized = dff_initialized,
+        .first_round = true,
     };
 }
 
 pub fn deinit(self: *CompiledCircuit) void {
     const allocator = self.allocator;
 
-    self.dff_initialized.deinit(allocator);
     self.dff_prev_clock.deinit(allocator);
 
     allocator.free(self.next_dirty);
@@ -273,18 +233,9 @@ pub fn deinit(self: *CompiledCircuit) void {
 
     self.dirty.deinit(allocator);
 
-    self.pending.deinit(allocator);
-    self.next_values.deinit(allocator);
     self.values.deinit(allocator);
 
-    allocator.free(self.consumers);
-    allocator.free(self.consumer_offsets);
-
-    allocator.free(self.outputs);
-    allocator.free(self.inputs);
-    allocator.free(self.input_starts);
-
-    allocator.free(self.ops);
+    self.topology.deinit(allocator);
 
     self.* = undefined;
 }
@@ -302,10 +253,10 @@ pub fn store(self: *CompiledCircuit, bus_index: BusIndex, value: bool) !void {
 
     self.values.setValue(bus, value);
 
-    const consumer_start: usize = @intCast(self.consumer_offsets[bus]);
-    const consumer_end: usize = @intCast(self.consumer_offsets[bus + 1]);
+    const consumer_start: usize = @intCast(self.topology.consumer_offsets[bus]);
+    const consumer_end: usize = @intCast(self.topology.consumer_offsets[bus + 1]);
 
-    for (self.consumers[consumer_start..consumer_end]) |chip_index| {
+    for (self.topology.consumers[consumer_start..consumer_end]) |chip_index| {
         const chip: usize = @intCast(@intFromEnum(chip_index));
 
         if (self.dirty.isSet(chip)) {
@@ -340,40 +291,36 @@ pub fn settle(self: *CompiledCircuit, max_rounds: usize) !void {
 
         rounds += 1;
 
-        const work_count = self.current_dirty_count;
-        for (self.current_dirty[0..work_count]) |chip_index| {
+        const work = self.current_dirty[0..self.current_dirty_count];
+        var changed_count: usize = 0;
+        for (work) |chip_index| {
             const chip: usize = @intCast(@intFromEnum(chip_index));
             self.dirty.unset(chip);
 
-            const op = self.ops[chip];
-            pfnRuns[@intFromEnum(op)](self, chip_index);
-        }
-
-        for (self.current_dirty[0..work_count]) |chip_index| {
-            const chip: usize = @intCast(@intFromEnum(chip_index));
-            const bus_index = self.outputs[chip];
-            const bus: usize = @intCast(@intFromEnum(bus_index));
-
-            if (!self.pending.isSet(bus)) {
-                continue;
-            }
-
-            self.pending.unset(bus);
-
+            const bus: usize = @intCast(@intFromEnum(self.topology.outputs[chip]));
             const old = self.values.isSet(bus);
-            const new = self.next_values.isSet(bus);
-
-            if (old == new) {
-                continue;
+            if (self.evaluate(chip) != old) {
+                // Only overwrite already processed positions in this work list.
+                work[changed_count] = chip_index;
+                changed_count += 1;
             }
+        }
+        // Every chip participates in the first round, including every DFF.
+        self.first_round = false;
 
-            self.values.setValue(bus, new);
+        for (work[0..changed_count]) |chip_index| {
+            const chip: usize = @intCast(@intFromEnum(chip_index));
+            const bus: usize = @intCast(@intFromEnum(self.topology.outputs[chip]));
 
-            const consumer_start: usize = @intCast(self.consumer_offsets[bus]);
+            // Values are bool and each output has one driver. A changed output
+            // is therefore its old value inverted. Commit only after evaluation.
+            self.values.toggle(bus);
 
-            const consumer_end: usize = @intCast(self.consumer_offsets[bus + 1]);
+            const consumer_start: usize = @intCast(self.topology.consumer_offsets[bus]);
 
-            for (self.consumers[consumer_start..consumer_end]) |consumer| {
+            const consumer_end: usize = @intCast(self.topology.consumer_offsets[bus + 1]);
+
+            for (self.topology.consumers[consumer_start..consumer_end]) |consumer| {
                 const consumer_chip: usize = @intCast(@intFromEnum(consumer));
 
                 if (self.dirty.isSet(consumer_chip)) {
@@ -398,86 +345,107 @@ pub fn settle(self: *CompiledCircuit, max_rounds: usize) !void {
     }
 }
 
-fn runAnd2(self: *CompiledCircuit, chip_index: ChipIndex) void {
-    const chip: usize = @intCast(@intFromEnum(chip_index));
+fn evaluate(self: *CompiledCircuit, chip: usize) bool {
+    const input_start: usize = @intCast(self.topology.input_starts[chip]);
+    const inputs = self.topology.inputs[input_start..];
+    const a = self.values.isSet(@intCast(@intFromEnum(inputs[0])));
 
-    const input_start: usize = @intCast(self.input_starts[chip]);
+    return switch (self.topology.ops[chip]) {
+        .not1 => !a,
+        .and2 => a and self.values.isSet(@intCast(@intFromEnum(inputs[1]))),
+        .or2 => a or self.values.isSet(@intCast(@intFromEnum(inputs[1]))),
+        .xor2 => a != self.values.isSet(@intCast(@intFromEnum(inputs[1]))),
+        .dff => blk: {
+            const clock = self.values.isSet(@intCast(@intFromEnum(inputs[1])));
+            const prev_clock = self.dff_prev_clock.isSet(chip);
+            self.dff_prev_clock.setValue(chip, clock);
 
-    const a: usize = @intCast(@intFromEnum(self.inputs[input_start]));
-    const b: usize = @intCast(@intFromEnum(self.inputs[input_start + 1]));
-    const out: usize = @intCast(@intFromEnum(self.outputs[chip]));
-
-    self.next_values.setValue(out, self.values.isSet(a) and self.values.isSet(b));
-
-    self.pending.set(out);
+            if (!self.first_round and !prev_clock and clock) break :blk a;
+            break :blk self.values.isSet(@intCast(@intFromEnum(self.topology.outputs[chip])));
+        },
+    };
 }
 
-fn runOr2(self: *CompiledCircuit, chip_index: ChipIndex) void {
-    const chip: usize = @intCast(@intFromEnum(chip_index));
-
-    const input_start: usize = @intCast(self.input_starts[chip]);
-
-    const a: usize = @intCast(@intFromEnum(self.inputs[input_start]));
-    const b: usize = @intCast(@intFromEnum(self.inputs[input_start + 1]));
-    const out: usize = @intCast(@intFromEnum(self.outputs[chip]));
-
-    self.next_values.setValue(out, self.values.isSet(a) or self.values.isSet(b));
-
-    self.pending.set(out);
+test "fanout offsets preserve chip order duplicate pins and empty buses" {
+    var topology = try Topology.init(std.testing.allocator, 7, &.{
+        .{ .op = .and2, .inputs = &.{ @enumFromInt(4), @enumFromInt(1) }, .output = @enumFromInt(0) },
+        .{ .op = .xor2, .inputs = &.{ @enumFromInt(1), @enumFromInt(1) }, .output = @enumFromInt(2) },
+        .{ .op = .not1, .inputs = &.{@enumFromInt(4)}, .output = @enumFromInt(3) },
+        .{ .op = .dff, .inputs = &.{ @enumFromInt(4), @enumFromInt(6) }, .output = @enumFromInt(5) },
+    });
+    defer topology.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 3, 3, 3, 6, 6, 7 }, topology.consumer_offsets);
+    const expected = [_]u32{ 0, 1, 1, 0, 2, 3, 3 };
+    for (expected, topology.consumers) |chip, consumer| try std.testing.expectEqual(chip, @intFromEnum(consumer));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 4, 5 }, topology.input_starts);
 }
 
-fn runXor2(self: *CompiledCircuit, chip_index: ChipIndex) void {
-    const chip: usize = @intCast(@intFromEnum(chip_index));
-
-    const input_start: usize = @intCast(self.input_starts[chip]);
-
-    const a: usize = @intCast(@intFromEnum(self.inputs[input_start]));
-    const b: usize = @intCast(@intFromEnum(self.inputs[input_start + 1]));
-    const out: usize = @intCast(@intFromEnum(self.outputs[chip]));
-
-    self.next_values.setValue(out, self.values.isSet(a) != self.values.isSet(b));
-
-    self.pending.set(out);
+test "topology rejects invalid pins buses and duplicate output drivers" {
+    try std.testing.expectError(error.InvalidArity, Topology.init(std.testing.allocator, 2, &.{
+        .{ .op = .and2, .inputs = &.{@enumFromInt(0)}, .output = @enumFromInt(1) },
+    }));
+    try std.testing.expectError(error.InvalidBus, Topology.init(std.testing.allocator, 2, &.{
+        .{ .op = .not1, .inputs = &.{@enumFromInt(2)}, .output = @enumFromInt(1) },
+    }));
+    try std.testing.expectError(error.InvalidBus, Topology.init(std.testing.allocator, 2, &.{
+        .{ .op = .not1, .inputs = &.{@enumFromInt(0)}, .output = @enumFromInt(2) },
+    }));
+    try std.testing.expectError(error.MultipleDrivers, Topology.init(std.testing.allocator, 2, &.{
+        .{ .op = .not1, .inputs = &.{@enumFromInt(0)}, .output = @enumFromInt(1) },
+        .{ .op = .not1, .inputs = &.{@enumFromInt(0)}, .output = @enumFromInt(1) },
+    }));
 }
 
-fn runNot1(self: *CompiledCircuit, chip_index: ChipIndex) void {
-    const chip: usize = @intCast(@intFromEnum(chip_index));
+test "dff observes a preloaded high clock and preserves externally stored output" {
+    var topology = try Topology.init(std.testing.allocator, 3, &.{
+        .{ .op = .dff, .inputs = &.{ @enumFromInt(0), @enumFromInt(1) }, .output = @enumFromInt(2) },
+    });
+    var circuit = CompiledCircuit.init(std.testing.allocator, &topology) catch |err| {
+        topology.deinit(std.testing.allocator);
+        return err;
+    };
+    defer circuit.deinit();
+    const d: BusIndex = @enumFromInt(0);
+    const clk: BusIndex = @enumFromInt(1);
+    const q: BusIndex = @enumFromInt(2);
+    try circuit.store(d, true);
+    try circuit.store(clk, true);
+    try std.testing.expectError(error.UnstableCircuit, circuit.settle(0));
+    try circuit.settle(1);
+    try std.testing.expectEqual(false, try circuit.load(q));
 
-    const input_start: usize = @intCast(self.input_starts[chip]);
+    try circuit.store(clk, false);
+    try circuit.settle(1);
+    try circuit.store(clk, true);
+    try circuit.settle(1);
+    try std.testing.expectEqual(true, try circuit.load(q));
 
-    const input: usize = @intCast(@intFromEnum(self.inputs[input_start]));
-    const out: usize = @intCast(@intFromEnum(self.outputs[chip]));
-
-    self.next_values.setValue(out, !self.values.isSet(input));
-
-    self.pending.set(out);
+    // No new rising edge: an unrelated store must not restore an old pending value.
+    try circuit.store(q, false);
+    try circuit.store(d, false);
+    try circuit.settle(1);
+    try std.testing.expectEqual(false, try circuit.load(q));
 }
 
-fn runDff(self: *CompiledCircuit, chip_index: ChipIndex) void {
-    const chip: usize = @intCast(@intFromEnum(chip_index));
-    const input_start: usize = @intCast(self.input_starts[chip]);
-
-    const d: usize = @intCast(@intFromEnum(self.inputs[input_start]));
-    const clk: usize = @intCast(@intFromEnum(self.inputs[input_start + 1]));
-    const out: usize = @intCast(@intFromEnum(self.outputs[chip]));
-    const clock = self.values.isSet(clk);
-
-    if (!self.dff_initialized.isSet(chip)) {
-        self.dff_initialized.set(chip);
-        self.dff_prev_clock.setValue(chip, clock);
-        return;
-    }
-
-    const prev_clock = self.dff_prev_clock.isSet(chip);
-    self.dff_prev_clock.setValue(chip, clock);
-
-    if (prev_clock or !clock) {
-        return;
-    }
-
-    self.next_values.setValue(out, self.values.isSet(d));
-
-    self.pending.set(out);
+test "changed chip compaction preserves later work and round resumption" {
+    var topology = try Topology.init(std.testing.allocator, 6, &.{
+        .{ .op = .and2, .inputs = &.{ @enumFromInt(0), @enumFromInt(1) }, .output = @enumFromInt(2) },
+        .{ .op = .not1, .inputs = &.{@enumFromInt(0)}, .output = @enumFromInt(3) },
+        .{ .op = .and2, .inputs = &.{ @enumFromInt(0), @enumFromInt(1) }, .output = @enumFromInt(4) },
+        .{ .op = .not1, .inputs = &.{@enumFromInt(3)}, .output = @enumFromInt(5) },
+    });
+    var circuit = CompiledCircuit.init(std.testing.allocator, &topology) catch |err| {
+        topology.deinit(std.testing.allocator);
+        return err;
+    };
+    defer circuit.deinit();
+    try std.testing.expectError(error.UnstableCircuit, circuit.settle(1));
+    try std.testing.expectEqual(false, try circuit.load(@enumFromInt(2)));
+    try std.testing.expectEqual(true, try circuit.load(@enumFromInt(3)));
+    try std.testing.expectEqual(false, try circuit.load(@enumFromInt(4)));
+    try std.testing.expectEqual(true, try circuit.load(@enumFromInt(5)));
+    try circuit.settle(1);
+    try std.testing.expectEqual(false, try circuit.load(@enumFromInt(5)));
 }
 
 test "compiled and" {

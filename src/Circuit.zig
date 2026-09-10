@@ -19,11 +19,6 @@ pub const Vec2 = struct {
     y: f32,
 };
 
-pub const InputPin = struct {
-    node: NodeId,
-    port: u16,
-};
-
 pub const OutputPin = struct {
     node: NodeId,
     port: u16,
@@ -49,10 +44,9 @@ pub const Node = struct {
 };
 
 pub const Net = struct {
+    // Reverse index for constant-time output conflict checks. Input connections
+    // live only on nodes; runtime fan-out is derived when compiling.
     driver: ?OutputPin = null,
-
-    // fan-out
-    consumers: std.ArrayListUnmanaged(InputPin) = .empty,
 };
 
 pub const InterfacePort = struct {
@@ -83,10 +77,6 @@ pub fn init(gpa: std.mem.Allocator) Circuit {
 pub fn deinit(self: *Circuit) void {
     for (self.nodes.values.items) |node| {
         self.gpa.free(node.connections);
-    }
-
-    for (self.nets.values.items) |*net| {
-        net.consumers.deinit(self.gpa);
     }
 
     self.outputs.deinit(self.gpa);
@@ -127,21 +117,8 @@ pub fn addNode(self: *Circuit, op: Op, position: Vec2) !NodeId {
 
 pub fn removeNode(self: *Circuit, node_id: NodeId) bool {
     const node = self.nodes.get(node_id) orelse return false;
-    const input_count = node.input_count;
-    const output_count = node.outputCount();
-
-    for (0..input_count) |port| {
-        self.disconnectInput(node_id, port);
-    }
-
-    for (0..output_count) |port| {
-        self.disconnectOutput(node_id, port);
-    }
-
-    const node_after_disconnect = self.nodes.get(node_id) orelse unreachable;
-
-    self.gpa.free(node_after_disconnect.connections);
-
+    for (0..node.outputCount()) |port| self.disconnectOutput(node_id, port);
+    self.gpa.free(node.connections);
     return self.nodes.destroy(node_id);
 }
 
@@ -150,112 +127,37 @@ pub fn addNet(self: *Circuit) !NetId {
 }
 
 pub fn removeNet(self: *Circuit, net_id: NetId) bool {
-    var input_index: usize = 0;
-    while (input_index < self.inputs.items.len) {
-        if (self.inputs.items[input_index].net == net_id) {
-            _ = self.inputs.orderedRemove(input_index);
-        } else {
-            input_index += 1;
+    if (self.nets.get(net_id) == null) return false;
+
+    for (self.nodes.values.items) |node| {
+        for (node.connections) |*connection| {
+            if (connection.* == net_id) connection.* = null;
         }
     }
 
-    var output_index: usize = 0;
-    while (output_index < self.outputs.items.len) {
-        if (self.outputs.items[output_index].net == net_id) {
-            _ = self.outputs.orderedRemove(output_index);
-        } else {
-            output_index += 1;
+    for ([_]*std.ArrayListUnmanaged(InterfacePort){ &self.inputs, &self.outputs }) |ports| {
+        var count: usize = 0;
+        for (ports.items) |port| {
+            if (port.net == net_id) continue;
+            ports.items[count] = port;
+            count += 1;
         }
+        ports.items.len = count;
     }
-
-    const net = self.nets.get(net_id) orelse return false;
-
-    if (net.driver) |driver| {
-        const node = self.nodes.get(driver.node) orelse unreachable;
-        const index = @as(usize, node.input_count) + @as(usize, driver.port);
-
-        std.debug.assert(index < node.connections.len);
-        std.debug.assert(node.connections[index].? == net_id);
-
-        node.connections[index] = null;
-    }
-
-    for (net.consumers.items) |consumer| {
-        const node = self.nodes.get(consumer.node) orelse unreachable;
-
-        const port: usize = consumer.port;
-
-        std.debug.assert(port < node.input_count);
-        std.debug.assert(node.connections[port].? == net_id);
-
-        node.connections[port] = null;
-    }
-
-    net.consumers.deinit(self.gpa);
 
     return self.nets.destroy(net_id);
 }
 
 pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
     const node = self.nodes.get(node_id) orelse return error.InvalidNode;
-
-    if (port >= node.input_count) {
-        return error.InvalidPort;
-    }
-
-    const net = self.nets.get(net_id) orelse return error.InvalidNet;
-
-    if (node.connections[port]) |old_net_id| {
-        if (old_net_id == net_id) {
-            return;
-        }
-    }
-
-    try net.consumers.ensureUnusedCapacity(self.gpa, 1);
-
-    if (node.connections[port]) |old_net_id| {
-        const old_net = self.nets.get(old_net_id) orelse unreachable;
-
-        var found = false;
-        for (old_net.consumers.items, 0..) |consumer, i| {
-            if (consumer.node == node_id and consumer.port == port) {
-                _ = old_net.consumers.swapRemove(i);
-                found = true;
-                break;
-            }
-        }
-
-        std.debug.assert(found);
-    }
-
-    net.consumers.appendAssumeCapacity(.{
-        .node = node_id,
-        .port = @intCast(port),
-    });
-
+    if (port >= node.input_count) return error.InvalidPort;
+    if (self.nets.get(net_id) == null) return error.InvalidNet;
     node.connections[port] = net_id;
 }
 
 pub fn disconnectInput(self: *Circuit, node_id: NodeId, port: usize) void {
     const node = self.nodes.get(node_id) orelse return;
-
-    if (port >= node.input_count) {
-        return;
-    }
-
-    const net_id = node.connections[port] orelse return;
-    const net = self.nets.get(net_id) orelse unreachable;
-    var found = false;
-    for (net.consumers.items, 0..) |consumer, i| {
-        if (consumer.node == node_id and consumer.port == port) {
-            _ = net.consumers.swapRemove(i);
-            found = true;
-            break;
-        }
-    }
-
-    std.debug.assert(found);
-
+    if (port >= node.input_count) return;
     node.connections[port] = null;
 }
 
@@ -453,11 +355,8 @@ test "circuit fanout survives node deletion" {
         net,
     );
 
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        circuit.nets.get(net).?
-            .consumers.items.len,
-    );
+    try std.testing.expect(circuit.nodes.get(a).?.connections[0] == net);
+    try std.testing.expect(circuit.nodes.get(b).?.connections[0] == net);
 
     try std.testing.expect(
         circuit.removeNode(a),
@@ -471,17 +370,8 @@ test "circuit fanout survives node deletion" {
         circuit.nodes.get(b) != null,
     );
 
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        circuit.nets.get(net).?
-            .consumers.items.len,
-    );
-
-    try std.testing.expect(
-        circuit.nets.get(net).?
-            .consumers.items[0]
-            .node == b,
-    );
+    try std.testing.expect(circuit.nodes.get(b).?.connections[0] == net);
+    try std.testing.expect(circuit.nets.get(net).?.driver.?.node == source);
 
     try std.testing.expect(
         circuit.removeNet(net),
@@ -506,4 +396,84 @@ test "circuit fanout survives node deletion" {
         circuit.nodes.get(b).?
             .connections[0] == null,
     );
+}
+
+test "input reconnect and disconnect allocate nothing and preserve other pins" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var circuit = Circuit.init(counted.allocator());
+    defer circuit.deinit();
+    const a = try circuit.addNet();
+    const b = try circuit.addNet();
+    const node = try circuit.addNode(.and2, .{ .x = 0, .y = 0 });
+    counted.fail_index = counted.alloc_index;
+    counted.resize_fail_index = counted.resize_index;
+
+    try circuit.connectInput(node, 0, a);
+    try circuit.connectInput(node, 1, a);
+    try circuit.connectInput(node, 0, b);
+    try circuit.connectInput(node, 0, b);
+    try std.testing.expect(circuit.nodes.get(node).?.connections[0] == b);
+    try std.testing.expect(circuit.nodes.get(node).?.connections[1] == a);
+    try std.testing.expectError(error.InvalidPort, circuit.connectInput(node, 2, a));
+    circuit.disconnectInput(node, 0);
+    circuit.disconnectInput(node, 0);
+    circuit.disconnectInput(node, 2);
+    try std.testing.expect(circuit.nodes.get(node).?.connections[0] == null);
+    try std.testing.expect(circuit.nodes.get(node).?.connections[1] == a);
+    try std.testing.expect(!counted.has_induced_failure);
+}
+
+test "output conflict leaves both drivers and connections intact" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+    const a = try circuit.addNet();
+    const b = try circuit.addNet();
+    const first = try circuit.addNode(.not1, .{ .x = 0, .y = 0 });
+    const second = try circuit.addNode(.not1, .{ .x = 0, .y = 0 });
+    try circuit.connectOutput(first, 0, a);
+    try circuit.connectOutput(second, 0, b);
+    try std.testing.expectError(error.MultipleDrivers, circuit.connectOutput(first, 0, b));
+    try std.testing.expect(circuit.nodes.get(first).?.connections[1] == a);
+    try std.testing.expect(circuit.nodes.get(second).?.connections[1] == b);
+    try std.testing.expect(circuit.nets.get(a).?.driver.?.node == first);
+    try std.testing.expect(circuit.nets.get(b).?.driver.?.node == second);
+
+    try std.testing.expect(circuit.removeNode(second));
+    try std.testing.expect(circuit.nets.get(b).?.driver == null);
+    try circuit.connectOutput(first, 0, b);
+    try std.testing.expect(circuit.nets.get(a).?.driver == null);
+    try std.testing.expect(circuit.nets.get(b).?.driver.?.node == first);
+    try std.testing.expect(circuit.nodes.get(first).?.connections[1] == b);
+    const replacement = try circuit.addNode(.not1, .{ .x = 0, .y = 0 });
+    try std.testing.expect(replacement.index == second.index);
+    try std.testing.expectError(error.InvalidNode, circuit.connectInput(second, 0, a));
+}
+
+test "net removal clears every pin and preserves interface order" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+    const a = try circuit.addNet();
+    const removed = try circuit.addNet();
+    const b = try circuit.addNet();
+    for ([_]NetId{ a, removed, b }) |net| {
+        _ = try circuit.addInput(net);
+        _ = try circuit.addOutput(net);
+    }
+    const node = try circuit.addNode(.and2, .{ .x = 0, .y = 0 });
+    try circuit.connectInput(node, 0, removed);
+    try circuit.connectInput(node, 1, removed);
+    try circuit.connectOutput(node, 0, removed);
+    try std.testing.expect(circuit.removeNet(removed));
+    for (circuit.nodes.get(node).?.connections) |connection| try std.testing.expect(connection == null);
+    for ([_][]const InterfacePort{ circuit.inputs.items, circuit.outputs.items }) |ports| {
+        try std.testing.expectEqual(@as(usize, 2), ports.len);
+        try std.testing.expect(ports[0].net == a);
+        try std.testing.expect(ports[1].net == b);
+    }
+    const replacement = try circuit.addNet();
+    try std.testing.expect(replacement.index == removed.index);
+    try circuit.connectInput(node, 0, replacement);
+    try std.testing.expectError(error.InvalidNet, circuit.connectInput(node, 0, removed));
+    try std.testing.expect(!circuit.removeNet(removed));
+    try std.testing.expect(circuit.nodes.get(node).?.connections[0] == replacement);
 }
