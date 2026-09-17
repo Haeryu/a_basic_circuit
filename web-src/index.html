@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101114">
+  <title>A Basic Circuit</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='4' y='4' width='24' height='24' rx='7' fill='%23f1b84b'/%3E%3Crect x='9' y='9' width='14' height='14' rx='3' fill='%23101114'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <h1><span class="brand-a">A</span> <span class="brand-b">B</span>asic <span class="brand-c">C</span>ircuit</h1>
+    </div>
+    <div class="topbar-actions">
+      <div class="action-cluster">
+        <button id="openButton" class="button" type="button" title="Open project (Ctrl+O)">Open</button>
+        <button id="saveButton" class="button" type="button" title="Save project (Ctrl+S)">Save</button>
+      </div>
+      <div class="action-cluster">
+        <button id="undoButton" class="button" type="button" title="Undo (Ctrl+Z)" disabled>Undo</button>
+        <button id="redoButton" class="button" type="button" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
+      </div>
+      <div id="simStatus" class="status loading" role="status">
+        <span class="status-dot"></span>
+        <span class="status-text">loading</span>
+      </div>
+      <div class="action-cluster">
+        <button id="copyButton" class="button" type="button" title="Copy selection (Ctrl+C)" disabled>Copy</button>
+        <button id="pasteButton" class="button" type="button" title="Paste at pointer (Ctrl+V)">Paste</button>
+        <button id="deleteButton" class="button danger" type="button" disabled>Delete</button>
+      </div>
+      <div class="action-cluster action-cluster-secondary">
+        <button id="chipButton" class="button secondary" type="button" disabled>Make chip</button>
+        <button id="demoButton" class="button secondary" type="button">Demo</button>
+        <button id="clearButton" class="button danger" type="button">Clear</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="app-shell">
+    <aside class="sidebar" aria-label="Gate palette">
+      <section>
+        <div class="section-label">IO</div>
+        <div class="palette-grid">
+          <button class="palette-item input" data-kind="input" type="button">
+            <span class="gate-icon">IN</span><span>Input</span>
+          </button>
+          <button class="palette-item output" data-kind="output" type="button">
+            <span class="gate-icon">OUT</span><span>Output</span>
+          </button>
+          <button class="palette-item" data-kind="oscillator" type="button"><span class="gate-icon">OSC</span><span>Oscillator</span></button>
+          <button class="palette-item" data-kind="clock" type="button"><span class="gate-icon">CLK</span><span>Clock counter</span></button>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-label">Logic</div>
+        <div class="palette-grid">
+          <button class="palette-item" data-kind="not" type="button">
+            <span class="gate-icon">¬</span><span>NOT</span>
+          </button>
+          <button class="palette-item" data-kind="buffer" type="button">
+            <span class="gate-icon">▷</span><span>Buffer</span>
+          </button>
+          <button class="palette-item" data-kind="and2" type="button">
+            <span class="gate-icon">&amp;</span><span>AND</span>
+          </button>
+          <button class="palette-item" data-kind="or2" type="button">
+            <span class="gate-icon">≥1</span><span>OR</span>
+          </button>
+          <button class="palette-item" data-kind="xor2" type="button">
+            <span class="gate-icon">=1</span><span>XOR</span>
+          </button>
+          <button class="palette-item" data-kind="nand2" type="button">
+            <span class="gate-icon">!&amp;</span><span>NAND</span>
+          </button>
+          <button class="palette-item" data-kind="nor2" type="button">
+            <span class="gate-icon">!≥1</span><span>NOR</span>
+          </button>
+          <button class="palette-item" data-kind="xnor2" type="button">
+            <span class="gate-icon">≡</span><span>XNOR</span>
+          </button>
+          <button class="palette-item wide" data-kind="dff" type="button">
+            <span class="gate-icon">D</span><span>D flip-flop</span>
+          </button>
+          <button class="palette-item wide" data-kind="register" type="button">
+            <span class="gate-icon">REG</span><span>Register</span>
+          </button>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-label">Routing &amp; arithmetic</div>
+        <div class="palette-grid">
+          <button class="palette-item" data-kind="mux" type="button"><span class="gate-icon">MUX</span><span>Multiplexer</span></button>
+          <button class="palette-item" data-kind="demux" type="button"><span class="gate-icon">DMX</span><span>Demultiplexer</span></button>
+          <button class="palette-item" data-kind="decoder" type="button"><span class="gate-icon">DEC</span><span>Decoder</span></button>
+          <button class="palette-item" data-kind="adder" type="button"><span class="gate-icon">+</span><span>Adder</span></button>
+          <button class="palette-item" data-kind="alu" type="button"><span class="gate-icon">ALU</span><span>ALU</span></button>
+          <button class="palette-item" data-kind="ram" type="button"><span class="gate-icon">RAM</span><span>RAM</span></button>
+          <button class="palette-item" data-kind="split" type="button"><span class="gate-icon">↗↘</span><span>Split bus</span></button>
+          <button class="palette-item" data-kind="join" type="button"><span class="gate-icon">⇉</span><span>Join buses</span></button>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-label">Displays</div>
+        <div class="palette-grid">
+          <button class="palette-item wide" data-display-bits="8" type="button">
+            <span class="gate-icon">LED</span><span>LED</span>
+          </button>
+        </div>
+      </section>
+
+      <section id="customSection">
+        <div class="section-label section-label-row">
+          <span>Custom chips</span>
+          <span class="section-actions">
+            <button id="importChipButton" class="section-action" type="button" title="Import chip module">Import</button>
+            <button id="exportChipButton" class="section-action" type="button" title="Export selected chips as a module" disabled>Export</button>
+            <button id="newChipButton" class="section-action" type="button">+ New</button>
+          </span>
+        </div>
+        <div id="customPalette" class="palette-grid"></div>
+      </section>
+
+      <div id="warningList" class="warning-panel" role="status" hidden></div>
+      <details class="help">
+        <summary>Shortcuts &amp; tips</summary>
+        <div class="help-content">
+          <p><strong>Drag</strong> a chip from the palette onto the canvas.</p>
+          <p><strong>Pan</strong> with the wheel, middle drag, or <kbd>Space</kbd> + drag. <kbd>Shift</kbd> + wheel pans sideways.</p>
+          <p><strong>Zoom</strong> with <kbd>Ctrl</kbd> + wheel. <kbd>F</kbd> fits the circuit.</p>
+          <p><strong>Select</strong> with an empty-canvas box or <kbd>Shift</kbd>-click. Move selected chips together.</p>
+          <p><strong>Copy / paste</strong> with <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>V</kbd>. Internal wires and custom definitions travel together.</p>
+          <p><strong>Wire</strong> by dragging between pins. Select a wire for its floating color/delete controls.</p>
+          <p><strong>Delete a wire</strong> with the floating ×, Delete/Backspace, double-click, or right-click.</p>
+          <p><strong>Make chip</strong> replaces the selection with one reusable chip; boundary wires become interface ports automatically.</p>
+          <p>Double-click a custom chip to enter it on the same canvas. Use the breadcrumb, <kbd>Esc</kbd>, or <kbd>Alt</kbd>+<kbd>↑</kbd> to return.</p>
+          <p><strong>+ New</strong> starts a chip from scratch with compact IN/OUT rails. Custom chips can contain other custom chips.</p>
+          <p><strong>Chip modules</strong>: mark palette chips with <strong>Pack</strong>, then Export them together as one <code>NAME.abc-chips.json</code>. Import loads only those reusable chip definitions, not the root circuit; shared nested dependencies are bundled once.</p>
+          <p><kbd>Esc</kbd> cancels a drag before leaving the current chip scope. Drag a selection to the trash to delete.</p>
+        </div>
+      </details>
+    </aside>
+
+    <section class="workspace" aria-label="Circuit workspace">
+      <nav id="scopeBar" class="scope-bar" aria-label="Circuit hierarchy">
+        <button id="scopeBack" class="scope-back" type="button" title="Go to parent circuit (Esc)" disabled>←</button>
+        <div id="scopeBreadcrumbs" class="scope-breadcrumbs"></div>
+      </nav>
+      <div class="viewport-tools" aria-label="Canvas view controls">
+        <button id="arrangeButton" class="button" type="button" title="Auto-arrange chips in the current scope">Arrange</button>
+        <button id="fitButton" class="button" type="button" title="Fit circuit (F)">Fit</button>
+        <button id="zoomOut" class="button" type="button" aria-label="Zoom out">−</button>
+        <span id="zoomLabel">100%</span>
+        <button id="zoomIn" class="button" type="button" aria-label="Zoom in">+</button>
+      </div>
+      <div id="canvas" class="canvas" tabindex="0" aria-label="Circuit canvas">
+        <div id="nodeLayer" class="node-layer"><div id="wireLayer" class="wire-layer" aria-label="Circuit wires"></div></div>
+        <div id="selectionBox" class="selection-box" hidden></div>
+        <div id="wireColorTools" class="wire-color-tools" hidden>
+          <span class="wire-tools-label">Wire</span>
+          <input id="wireColorInput" type="color" value="#ffd36f" aria-label="Selected wire color" title="Wire color">
+          <button id="wireColorReset" class="wire-tool-button" type="button" title="Use automatic signal colors">Auto</button>
+          <span class="wire-tools-divider" aria-hidden="true"></span>
+          <button id="wireDeleteQuick" class="wire-tool-button wire-tool-delete" type="button" aria-label="Delete selected wire" title="Delete wire">×</button>
+        </div>
+        <div id="emptyHint" class="empty-hint" hidden>
+          <div class="empty-icon">+</div>
+          <strong>Drag a gate in from the left</strong>
+          <span>Set any bus width from 1 to 64 on each component.</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="trashDrop" class="trash-drop" aria-hidden="true">
+    <span class="trash-icon">⌫</span>
+    <span>Drop to delete</span>
+  </div>
+
+  <footer class="footer">
+    <span id="nodeCount">0 nodes</span>
+    <span id="footerTip" class="footer-tip">Disconnected inputs read as 0.</span>
+  </footer>
+
+  <datalist id="widthChoices">
+    <option value="1"></option><option value="2"></option><option value="3"></option><option value="4"></option>
+    <option value="8"></option><option value="16"></option><option value="32"></option><option value="64"></option>
+  </datalist>
+  <input id="projectFile" type="file" accept=".json,.abc,application/json" hidden>
+  <input id="chipFile" type="file" accept=".json,.abc-chip,.abc-chips,application/json" hidden>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

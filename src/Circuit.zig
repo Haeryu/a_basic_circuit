@@ -2,478 +2,1161 @@ const Circuit = @This();
 
 const std = @import("std");
 
-const DenseGenPool = @import("dense_gen_pool.zig").DenseGenPool;
-const GenHandle = @import("dense_gen_pool.zig").GenHandle;
-const Op = @import("op.zig").Op;
+pub const NodeId = enum(u32) {
+    invalid = std.math.maxInt(u32),
+    _,
 
-const NodeTag = struct {};
-const NetTag = struct {};
-const CircuitTag = struct {};
-
-pub const NodeId = GenHandle(NodeTag);
-pub const NetId = GenHandle(NetTag);
-pub const Id = GenHandle(CircuitTag);
-
-pub const Vec2 = struct {
-    x: f32,
-    y: f32,
-};
-
-pub const OutputPin = struct {
-    node: NodeId,
-    port: u16,
-};
-
-pub const NodeKind = union(enum) {
-    primitive: Op,
-    subcircuit: Circuit.Id,
-};
-
-pub const Node = struct {
-    kind: NodeKind,
-    position: Vec2,
-
-    input_count: u16,
-
-    // [ inputs ][ outputs ]
-    connections: []?NetId,
-
-    pub fn outputCount(self: *const Node) usize {
-        return self.connections.len - self.input_count;
+    fn index(self: NodeId) usize {
+        return @intCast(@intFromEnum(self));
     }
 };
 
-pub const Net = struct {
-    // Reverse index for constant-time output conflict checks. Input connections
-    // live only on nodes; runtime fan-out is derived when compiling.
-    driver: ?OutputPin = null,
+pub const Kind = enum(u8) {
+    input = 0,
+    output = 1,
+    not = 2,
+    and2 = 3,
+    or2 = 4,
+    xor2 = 5,
+    dff = 6,
+    buffer = 7,
+    nand2 = 8,
+    nor2 = 9,
+    xnor2 = 10,
+    counter = 11,
+
+    pub fn inputCount(self: Kind) usize {
+        return switch (self) {
+            .input => 0,
+            .output, .not, .buffer => 1,
+            .and2, .or2, .xor2, .dff, .nand2, .nor2, .xnor2 => 2,
+            .counter => 3,
+        };
+    }
 };
 
-pub const InterfacePort = struct {
-    net: NetId,
+pub const RunResult = enum(u8) {
+    settled,
+    pending,
 };
 
-const NodePool = DenseGenPool(Node, NodeId);
-const NetPool = DenseGenPool(Net, NetId);
+const Node = struct {
+    kind: Kind,
+    // Counter lanes use [0] for their DATA bit and [1] for the group index.
+    // Shared CLK/LOAD live in CounterGroup; ordinary gate nodes stay compact.
+    inputs: [2]NodeId = .{ .invalid, .invalid },
+    value: bool = false,
+    previous_clock: bool = false,
+    alive: bool = true,
+};
 
-gpa: std.mem.Allocator,
+const CounterGroup = struct {
+    first: NodeId,
+    width: u8,
+    clock: NodeId = .invalid,
+    load: NodeId = .invalid,
+    count: u64 = 0,
+    previous_clock: bool = false,
+    alive: bool = true,
+    last_evaluated_round: u64 = 0,
+};
 
-nodes: NodePool,
-nets: NetPool,
+allocator: std.mem.Allocator,
+nodes: std.ArrayListUnmanaged(Node) = .empty,
+counter_groups: std.ArrayListUnmanaged(CounterGroup) = .empty,
 
-inputs: std.ArrayListUnmanaged(InterfacePort),
-outputs: std.ArrayListUnmanaged(InterfacePort),
+// Rebuilt only when the graph changes. offsets/source -> consumers is CSR.
+fanout_offsets: std.ArrayListUnmanaged(u32) = .empty,
+fanout: std.ArrayListUnmanaged(NodeId) = .empty,
 
-pub fn init(gpa: std.mem.Allocator) Circuit {
-    return .{
-        .gpa = gpa,
-        .nodes = .init,
-        .nets = .init,
-        .inputs = .empty,
-        .outputs = .empty,
-    };
+current: std.ArrayListUnmanaged(NodeId) = .empty,
+next: std.ArrayListUnmanaged(NodeId) = .empty,
+queued: std.ArrayListUnmanaged(bool) = .empty,
+
+topology_dirty: bool = true,
+round_serial: u64 = 0,
+
+pub fn init(allocator: std.mem.Allocator) Circuit {
+    return .{ .allocator = allocator };
 }
 
 pub fn deinit(self: *Circuit) void {
-    for (self.nodes.values.items) |node| {
-        self.gpa.free(node.connections);
-    }
-
-    self.outputs.deinit(self.gpa);
-    self.inputs.deinit(self.gpa);
-
-    self.nets.deinit(self.gpa);
-    self.nodes.deinit(self.gpa);
-
+    const allocator = self.allocator;
+    self.queued.deinit(allocator);
+    self.next.deinit(allocator);
+    self.current.deinit(allocator);
+    self.fanout.deinit(allocator);
+    self.fanout_offsets.deinit(allocator);
+    self.counter_groups.deinit(allocator);
+    self.nodes.deinit(allocator);
     self.* = undefined;
 }
 
-pub fn addNode(self: *Circuit, op: Op, position: Vec2) !NodeId {
-    const input_count = op.inputCount();
-    const output_count = op.outputCount();
+pub fn addNode(self: *Circuit, kind: Kind) !NodeId {
+    if (kind == .counter) return self.addCounter(1);
 
-    if (input_count > std.math.maxInt(u16) or output_count > std.math.maxInt(u16)) {
-        return error.TooManyPins;
-    }
+    // Keep one u32 value for `.invalid` and one addressable CSR sentinel at
+    // fanout_offsets[node_count], including on wasm32 where usize is also u32.
+    if (self.nodes.items.len >= std.math.maxInt(u32) - 1) return error.CircuitTooLarge;
 
-    const total = std.math.add(usize, input_count, output_count) catch {
-        return error.TooManyPins;
-    };
+    const id: NodeId = @enumFromInt(@as(u32, @intCast(self.nodes.items.len)));
+    try self.nodes.append(self.allocator, .{ .kind = kind });
+    self.topology_dirty = true;
+    return id;
+}
 
-    const connections = try self.gpa.alloc(?NetId, total);
-    errdefer self.gpa.free(connections);
+/// Add a native binary counter as contiguous single-bit output nodes.
+/// Pins 0 (CLK) and 1 (LOAD) are shared across the group; pin 2 sets a lane's
+/// DATA bit. On a rising CLK edge, LOAD selects DATA instead of incrementing.
+pub fn addCounter(self: *Circuit, width: usize) !NodeId {
+    if (width == 0 or width > 64) return error.InvalidWidth;
 
-    @memset(connections, null);
+    const max_node_count: usize = std.math.maxInt(u32) - 1;
+    if (self.nodes.items.len > max_node_count - width) return error.CircuitTooLarge;
+    if (self.counter_groups.items.len >= max_node_count) return error.CircuitTooLarge;
 
-    return self.nodes.create(self.gpa, .{
-        .kind = .{
-            .primitive = op,
-        },
-        .position = position,
-        .input_count = @intCast(input_count),
-        .connections = connections,
+    // Reserve every fallible allocation before changing either logical length.
+    try self.counter_groups.ensureUnusedCapacity(self.allocator, 1);
+    try self.nodes.ensureUnusedCapacity(self.allocator, width);
+
+    const first: NodeId = @enumFromInt(@as(u32, @intCast(self.nodes.items.len)));
+    const group_id: NodeId = @enumFromInt(@as(u32, @intCast(self.counter_groups.items.len)));
+    self.counter_groups.appendAssumeCapacity(.{
+        .first = first,
+        .width = @intCast(width),
     });
+
+    for (0..width) |_| {
+        self.nodes.appendAssumeCapacity(.{
+            .kind = .counter,
+            .inputs = .{ .invalid, group_id },
+        });
+    }
+
+    self.topology_dirty = true;
+    return first;
 }
 
-pub fn removeNode(self: *Circuit, node_id: NodeId) bool {
-    const node = self.nodes.get(node_id) orelse return false;
-    for (0..node.outputCount()) |port| self.disconnectOutput(node_id, port);
-    self.gpa.free(node.connections);
-    return self.nodes.destroy(node_id);
-}
-
-pub fn addNet(self: *Circuit) !NetId {
-    return self.nets.create(self.gpa, .{});
-}
-
-pub fn removeNet(self: *Circuit, net_id: NetId) bool {
-    if (self.nets.get(net_id) == null) return false;
-
-    for (self.nodes.values.items) |node| {
-        for (node.connections) |*connection| {
-            if (connection.* == net_id) connection.* = null;
-        }
+pub fn removeNode(self: *Circuit, id: NodeId) bool {
+    const removed = self.node(id) orelse return false;
+    if (removed.kind == .counter) {
+        const group_index = self.counterGroupIndex(removed) orelse return false;
+        return self.removeCounterGroup(group_index);
     }
 
-    for ([_]*std.ArrayListUnmanaged(InterfacePort){ &self.inputs, &self.outputs }) |ports| {
-        var count: usize = 0;
-        for (ports.items) |port| {
-            if (port.net == net_id) continue;
-            ports.items[count] = port;
-            count += 1;
-        }
-        ports.items.len = count;
-    }
+    removed.alive = false;
+    removed.value = false;
+    removed.inputs = .{ .invalid, .invalid };
+    removed.previous_clock = false;
 
-    return self.nets.destroy(net_id);
-}
+    // Editing is cold compared with simulation. Scanning here avoids a second
+    // mutable reverse-index structure that would have to stay in sync.
+    self.clearDownstreamRange(id.index(), id.index() + 1);
 
-pub fn connectInput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
-    const node = self.nodes.get(node_id) orelse return error.InvalidNode;
-    if (port >= node.input_count) return error.InvalidPort;
-    if (self.nets.get(net_id) == null) return error.InvalidNet;
-    node.connections[port] = net_id;
-}
-
-pub fn disconnectInput(self: *Circuit, node_id: NodeId, port: usize) void {
-    const node = self.nodes.get(node_id) orelse return;
-    if (port >= node.input_count) return;
-    node.connections[port] = null;
-}
-
-pub fn connectOutput(self: *Circuit, node_id: NodeId, port: usize, net_id: NetId) !void {
-    const node = self.nodes.get(node_id) orelse return error.InvalidNode;
-
-    const input_count = node.input_count;
-    const output_count = node.outputCount();
-
-    if (port >= output_count) {
-        return error.InvalidPort;
-    }
-
-    const net = self.nets.get(net_id) orelse return error.InvalidNet;
-
-    if (net.driver) |driver| {
-        if (driver.node == node_id and driver.port == port) {
-            return;
-        }
-
-        return error.MultipleDrivers;
-    }
-
-    const connection_index = input_count + port;
-
-    if (node.connections[connection_index]) |old_net_id| {
-        if (old_net_id == net_id) {
-            return;
-        }
-
-        const old_net = self.nets.get(old_net_id) orelse unreachable;
-
-        std.debug.assert(old_net.driver != null);
-        std.debug.assert(old_net.driver.?.node == node_id);
-        std.debug.assert(old_net.driver.?.port == port);
-
-        old_net.driver = null;
-    }
-
-    net.driver = .{
-        .node = node_id,
-        .port = @intCast(port),
-    };
-
-    node.connections[connection_index] = net_id;
-}
-
-pub fn disconnectOutput(self: *Circuit, node_id: NodeId, port: usize) void {
-    const node = self.nodes.get(node_id) orelse return;
-    const input_count = node.input_count;
-    const output_count = node.outputCount();
-
-    if (port >= output_count) {
-        return;
-    }
-
-    const connection_index = input_count + port;
-    const net_id = node.connections[connection_index] orelse return;
-
-    const net = self.nets.get(net_id) orelse unreachable;
-
-    std.debug.assert(net.driver != null);
-    std.debug.assert(net.driver.?.node == node_id);
-    std.debug.assert(net.driver.?.port == port);
-
-    net.driver = null;
-    node.connections[connection_index] = null;
-}
-
-pub fn addInput(self: *Circuit, net_id: NetId) !usize {
-    if (self.nets.get(net_id) == null) {
-        return error.InvalidNet;
-    }
-
-    for (self.inputs.items) |port| {
-        if (port.net == net_id) {
-            return error.AlreadyInput;
-        }
-    }
-
-    const index = self.inputs.items.len;
-
-    try self.inputs.append(self.gpa, .{ .net = net_id });
-
-    return index;
-}
-
-pub fn addOutput(self: *Circuit, net_id: NetId) !usize {
-    if (self.nets.get(net_id) == null) {
-        return error.InvalidNet;
-    }
-
-    for (self.outputs.items) |port| {
-        if (port.net == net_id) {
-            return error.AlreadyOutput;
-        }
-    }
-
-    const index = self.outputs.items.len;
-
-    try self.outputs.append(self.gpa, .{ .net = net_id });
-
-    return index;
-}
-
-pub fn removeInput(self: *Circuit, index: usize) bool {
-    if (index >= self.inputs.items.len) {
-        return false;
-    }
-
-    _ = self.inputs.orderedRemove(index);
+    self.topology_dirty = true;
     return true;
 }
 
-pub fn removeOutput(self: *Circuit, index: usize) bool {
-    if (index >= self.outputs.items.len) {
-        return false;
+/// Connect one node's single-bit output directly to an input pin.
+/// Fan-out is represented by several input pins referring to the same source.
+pub fn connect(self: *Circuit, source_id: NodeId, target_id: NodeId, pin: usize) !void {
+    _ = self.node(source_id) orelse return error.InvalidNode;
+    const target = self.node(target_id) orelse return error.InvalidNode;
+    if (pin >= target.kind.inputCount()) return error.InvalidPin;
+    if (self.inputSource(target, pin) == source_id) return;
+
+    if (target.kind == .counter) {
+        const group_index = self.counterGroupIndex(target) orelse return error.InvalidNode;
+        switch (pin) {
+            0 => self.counter_groups.items[group_index].clock = source_id,
+            1 => self.counter_groups.items[group_index].load = source_id,
+            2 => target.inputs[0] = source_id,
+            else => unreachable,
+        }
+    } else {
+        target.inputs[pin] = source_id;
     }
 
-    _ = self.outputs.orderedRemove(index);
+    self.topology_dirty = true;
+}
+
+pub fn disconnect(self: *Circuit, target_id: NodeId, pin: usize) bool {
+    const target = self.node(target_id) orelse return false;
+    if (pin >= target.kind.inputCount()) return false;
+    if (self.inputSource(target, pin) == .invalid) return false;
+
+    if (target.kind == .counter) {
+        const group_index = self.counterGroupIndex(target) orelse return false;
+        switch (pin) {
+            0 => self.counter_groups.items[group_index].clock = .invalid,
+            1 => self.counter_groups.items[group_index].load = .invalid,
+            2 => target.inputs[0] = .invalid,
+            else => unreachable,
+        }
+    } else {
+        target.inputs[pin] = .invalid;
+    }
+
+    self.topology_dirty = true;
     return true;
 }
 
-pub fn addSubcircuitNode(
-    self: *Circuit,
-    circuit_id: Circuit.Id,
-    child: *const Circuit,
-    position: Vec2,
-) !NodeId {
-    const input_count = child.inputs.items.len;
-    const output_count = child.outputs.items.len;
+pub fn setInput(self: *Circuit, id: NodeId, input_value: bool) !void {
+    const input = self.node(id) orelse return error.InvalidNode;
+    if (input.kind != .input) return error.NotInput;
+    if (input.value == input_value) return;
 
-    if (input_count > std.math.maxInt(u16) or output_count > std.math.maxInt(u16)) {
-        return error.TooManyPins;
+    input.value = input_value;
+
+    // A dirty topology will schedule every live non-input node on rebuild.
+    if (!self.topology_dirty) self.scheduleConsumers(&self.current, id);
+}
+
+/// Set a counter atomically without inventing or consuming a clock edge.
+pub fn setCounter(self: *Circuit, id: NodeId, count: u64) !void {
+    const lane = self.node(id) orelse return error.InvalidNode;
+    if (lane.kind != .counter) return error.NotCounter;
+    const group_index = self.counterGroupIndex(lane) orelse return error.InvalidNode;
+    const group = &self.counter_groups.items[group_index];
+    if (count & ~counterMask(group.width) != 0) return error.ValueOutOfRange;
+    group.count = count;
+    const first = group.first.index();
+    for (0..group.width) |bit| {
+        const output_lane = &self.nodes.items[first + bit];
+        const output = count & (@as(u64, 1) << @intCast(bit)) != 0;
+        if (output_lane.value == output) continue;
+        output_lane.value = output;
+        if (!self.topology_dirty) self.scheduleConsumers(&self.current, counterLane(group.first, bit));
+    }
+}
+
+pub fn value(self: *const Circuit, id: NodeId) !bool {
+    const n = self.nodeConst(id) orelse return error.InvalidNode;
+    return n.value;
+}
+
+/// Editor checkpoint: bit 0 is the output, bit 1 the sequential clock history.
+pub fn state(self: *const Circuit, id: NodeId) !u2 {
+    const n = self.nodeConst(id) orelse return error.InvalidNode;
+    const previous_clock = if (n.kind == .counter) blk: {
+        const group_index = self.counterGroupIndex(n) orelse return error.InvalidNode;
+        break :blk self.counter_groups.items[group_index].previous_clock;
+    } else n.previous_clock;
+    return @as(u2, @intFromBool(n.value)) | (@as(u2, @intFromBool(previous_clock)) << 1);
+}
+
+pub fn restoreState(self: *Circuit, id: NodeId, saved: u2) !void {
+    const n = self.node(id) orelse return error.InvalidNode;
+    const output = saved & 1 != 0;
+    n.value = output;
+
+    if (n.kind == .counter) {
+        const group_index = self.counterGroupIndex(n) orelse return error.InvalidNode;
+        const group = &self.counter_groups.items[group_index];
+        const bit_index = id.index() - group.first.index();
+        const bit = @as(u64, 1) << @intCast(bit_index);
+        if (output) {
+            group.count |= bit;
+        } else {
+            group.count &= ~bit;
+        }
+        group.previous_clock = saved & 2 != 0;
+    } else {
+        n.previous_clock = n.kind == .dff and saved & 2 != 0;
+    }
+    self.topology_dirty = true;
+}
+
+/// Execute at most `max_rounds` synchronous delta rounds.
+/// `pending` means more propagation remains; it is deliberately not classified
+/// as an error because the caller may resume with another `run` call.
+pub fn run(self: *Circuit, max_rounds: usize) !RunResult {
+    try self.rebuildIfNeeded();
+
+    var rounds: usize = 0;
+    while (self.current.items.len != 0) {
+        if (rounds == max_rounds) return .pending;
+        rounds += 1;
+        self.beginRound();
+
+        // The current round is no longer queued. A changed source may schedule
+        // any of these nodes again for the next round.
+        for (self.current.items) |id| {
+            self.queued.items[id.index()] = false;
+        }
+
+        var changed_count: usize = 0;
+        const work = self.current.items;
+        for (work) |id| {
+            const idx = id.index();
+            const n = &self.nodes.items[idx];
+            if (!n.alive or n.kind == .input) continue;
+
+            const old_value = n.value;
+            if (self.evaluate(idx) != old_value) {
+                work[changed_count] = id;
+                changed_count += 1;
+            }
+        }
+
+        // Commit after evaluating the whole round. Sequential nodes therefore
+        // sample the same old outputs even when they feed one another.
+        for (work[0..changed_count]) |id| {
+            const idx = id.index();
+            self.nodes.items[idx].value = !self.nodes.items[idx].value;
+            self.scheduleConsumers(&self.next, id);
+        }
+
+        std.mem.swap(std.ArrayListUnmanaged(NodeId), &self.current, &self.next);
+        self.next.clearRetainingCapacity();
     }
 
-    const connection_count = std.math.add(usize, input_count, output_count) catch
-        return error.TooManyPins;
+    return .settled;
+}
 
-    const connections = try self.gpa.alloc(?NetId, connection_count);
-    errdefer self.gpa.free(connections);
+fn beginRound(self: *Circuit) void {
+    self.round_serial +%= 1;
+    if (self.round_serial != 0) return;
 
-    @memset(connections, null);
+    // A serial wrap must not make a dormant group look evaluated this round.
+    for (self.counter_groups.items) |*group| group.last_evaluated_round = 0;
+    self.round_serial = 1;
+}
 
-    return self.nodes.create(self.gpa, .{
-        .kind = .{
-            .subcircuit = circuit_id,
+fn rebuildIfNeeded(self: *Circuit) !void {
+    if (!self.topology_dirty) return;
+
+    const allocator = self.allocator;
+    const node_count = self.nodes.items.len;
+
+    try self.fanout_offsets.resize(allocator, node_count + 1);
+    @memset(self.fanout_offsets.items, 0);
+
+    var edge_count: usize = 0;
+    for (self.nodes.items) |n| {
+        if (!n.alive) continue;
+        for (0..n.kind.inputCount()) |pin| {
+            const source_id = self.inputSource(&n, pin);
+            _ = self.nodeConst(source_id) orelse continue;
+            const source_index = source_id.index();
+            if (self.fanout_offsets.items[source_index] == std.math.maxInt(u32)) {
+                return error.CircuitTooLarge;
+            }
+            self.fanout_offsets.items[source_index] += 1;
+            edge_count = std.math.add(usize, edge_count, 1) catch return error.CircuitTooLarge;
+            if (edge_count > std.math.maxInt(u32)) return error.CircuitTooLarge;
+        }
+    }
+
+    try self.fanout.resize(allocator, edge_count);
+
+    // Counts -> end positions. Filling backwards decrements them into starts,
+    // leaving a complete CSR offset table without a temporary cursor buffer.
+    var end: u32 = 0;
+    for (self.fanout_offsets.items[0..node_count]) |*offset| {
+        end += offset.*;
+        offset.* = end;
+    }
+    self.fanout_offsets.items[node_count] = end;
+
+    var target_index = node_count;
+    while (target_index != 0) {
+        target_index -= 1;
+        const target = self.nodes.items[target_index];
+        if (!target.alive) continue;
+
+        var pin = target.kind.inputCount();
+        while (pin != 0) {
+            pin -= 1;
+            const source_id = self.inputSource(&target, pin);
+            if (self.nodeConst(source_id) == null) continue;
+            const source_index = source_id.index();
+            self.fanout_offsets.items[source_index] -= 1;
+            const at: usize = @intCast(self.fanout_offsets.items[source_index]);
+            self.fanout.items[at] = @enumFromInt(@as(u32, @intCast(target_index)));
+        }
+    }
+
+    try self.current.ensureTotalCapacity(allocator, node_count);
+    try self.next.ensureTotalCapacity(allocator, node_count);
+    try self.queued.resize(allocator, node_count);
+    @memset(self.queued.items, false);
+    self.current.clearRetainingCapacity();
+    self.next.clearRetainingCapacity();
+
+    for (self.nodes.items, 0..) |*n, i| {
+        if (!n.alive) continue;
+        if (n.kind == .input) continue;
+
+        const id: NodeId = @enumFromInt(@as(u32, @intCast(i)));
+        self.current.appendAssumeCapacity(id);
+        self.queued.items[i] = true;
+    }
+
+    self.topology_dirty = false;
+}
+
+fn evaluate(self: *Circuit, node_index: usize) bool {
+    const n = &self.nodes.items[node_index];
+    if (n.kind == .counter) return self.evaluateCounter(node_index);
+
+    const a = self.readInput(n, 0);
+    return switch (n.kind) {
+        .input => n.value,
+        .output => a,
+        .not => !a,
+        .buffer => a,
+        .and2 => a and self.readInput(n, 1),
+        .or2 => a or self.readInput(n, 1),
+        .xor2 => a != self.readInput(n, 1),
+        .nand2 => !(a and self.readInput(n, 1)),
+        .nor2 => !(a or self.readInput(n, 1)),
+        .xnor2 => a == self.readInput(n, 1),
+        .dff => blk: {
+            const clock = self.readInput(n, 1);
+            const rising = !n.previous_clock and clock;
+            n.previous_clock = clock;
+            break :blk if (rising) a else n.value;
         },
-        .position = position,
-        .input_count = @intCast(input_count),
-        .connections = connections,
-    });
+        .counter => unreachable,
+    };
 }
 
-test "circuit fanout survives node deletion" {
-    var circuit = Circuit.init(std.testing.allocator);
-    defer circuit.deinit();
+fn evaluateCounter(self: *Circuit, node_index: usize) bool {
+    const n = &self.nodes.items[node_index];
+    const group_index = self.counterGroupIndex(n) orelse return n.value;
 
-    //
-    // source.OUT ── net ─┬─> a.IN
-    //                    └─> b.IN
-
-    const source = try circuit.addNode(
-        .not1,
-        .{ .x = 0, .y = 0 },
-    );
-
-    const a = try circuit.addNode(
-        .not1,
-        .{ .x = 100, .y = -50 },
-    );
-
-    const b = try circuit.addNode(
-        .not1,
-        .{ .x = 100, .y = 50 },
-    );
-
-    const net = try circuit.addNet();
-
-    try circuit.connectOutput(
-        source,
-        0,
-        net,
-    );
-
-    try circuit.connectInput(
-        a,
-        0,
-        net,
-    );
-
-    try circuit.connectInput(
-        b,
-        0,
-        net,
-    );
-
-    try std.testing.expect(circuit.nodes.get(a).?.connections[0] == net);
-    try std.testing.expect(circuit.nodes.get(b).?.connections[0] == net);
-
-    try std.testing.expect(
-        circuit.removeNode(a),
-    );
-
-    try std.testing.expect(
-        circuit.nodes.get(a) == null,
-    );
-
-    try std.testing.expect(
-        circuit.nodes.get(b) != null,
-    );
-
-    try std.testing.expect(circuit.nodes.get(b).?.connections[0] == net);
-    try std.testing.expect(circuit.nets.get(net).?.driver.?.node == source);
-
-    try std.testing.expect(
-        circuit.removeNet(net),
-    );
-
-    try std.testing.expect(
-        circuit.nets.get(net) == null,
-    );
-
-    // source output disconnected.
-    //
-    // NOT:
-    // connections[0] = input
-    // connections[1] = output
-    try std.testing.expect(
-        circuit.nodes.get(source).?
-            .connections[1] == null,
-    );
-
-    // b input disconnected.
-    try std.testing.expect(
-        circuit.nodes.get(b).?
-            .connections[0] == null,
-    );
-}
-
-test "input reconnect and disconnect allocate nothing and preserve other pins" {
-    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var circuit = Circuit.init(counted.allocator());
-    defer circuit.deinit();
-    const a = try circuit.addNet();
-    const b = try circuit.addNet();
-    const node = try circuit.addNode(.and2, .{ .x = 0, .y = 0 });
-    counted.fail_index = counted.alloc_index;
-    counted.resize_fail_index = counted.resize_index;
-
-    try circuit.connectInput(node, 0, a);
-    try circuit.connectInput(node, 1, a);
-    try circuit.connectInput(node, 0, b);
-    try circuit.connectInput(node, 0, b);
-    try std.testing.expect(circuit.nodes.get(node).?.connections[0] == b);
-    try std.testing.expect(circuit.nodes.get(node).?.connections[1] == a);
-    try std.testing.expectError(error.InvalidPort, circuit.connectInput(node, 2, a));
-    circuit.disconnectInput(node, 0);
-    circuit.disconnectInput(node, 0);
-    circuit.disconnectInput(node, 2);
-    try std.testing.expect(circuit.nodes.get(node).?.connections[0] == null);
-    try std.testing.expect(circuit.nodes.get(node).?.connections[1] == a);
-    try std.testing.expect(!counted.has_induced_failure);
-}
-
-test "output conflict leaves both drivers and connections intact" {
-    var circuit = Circuit.init(std.testing.allocator);
-    defer circuit.deinit();
-    const a = try circuit.addNet();
-    const b = try circuit.addNet();
-    const first = try circuit.addNode(.not1, .{ .x = 0, .y = 0 });
-    const second = try circuit.addNode(.not1, .{ .x = 0, .y = 0 });
-    try circuit.connectOutput(first, 0, a);
-    try circuit.connectOutput(second, 0, b);
-    try std.testing.expectError(error.MultipleDrivers, circuit.connectOutput(first, 0, b));
-    try std.testing.expect(circuit.nodes.get(first).?.connections[1] == a);
-    try std.testing.expect(circuit.nodes.get(second).?.connections[1] == b);
-    try std.testing.expect(circuit.nets.get(a).?.driver.?.node == first);
-    try std.testing.expect(circuit.nets.get(b).?.driver.?.node == second);
-
-    try std.testing.expect(circuit.removeNode(second));
-    try std.testing.expect(circuit.nets.get(b).?.driver == null);
-    try circuit.connectOutput(first, 0, b);
-    try std.testing.expect(circuit.nets.get(a).?.driver == null);
-    try std.testing.expect(circuit.nets.get(b).?.driver.?.node == first);
-    try std.testing.expect(circuit.nodes.get(first).?.connections[1] == b);
-    const replacement = try circuit.addNode(.not1, .{ .x = 0, .y = 0 });
-    try std.testing.expect(replacement.index == second.index);
-    try std.testing.expectError(error.InvalidNode, circuit.connectInput(second, 0, a));
-}
-
-test "net removal clears every pin and preserves interface order" {
-    var circuit = Circuit.init(std.testing.allocator);
-    defer circuit.deinit();
-    const a = try circuit.addNet();
-    const removed = try circuit.addNet();
-    const b = try circuit.addNet();
-    for ([_]NetId{ a, removed, b }) |net| {
-        _ = try circuit.addInput(net);
-        _ = try circuit.addOutput(net);
+    if (self.counter_groups.items[group_index].last_evaluated_round != self.round_serial) {
+        const clock = self.readInput(n, 0);
+        const mutable_group = &self.counter_groups.items[group_index];
+        mutable_group.last_evaluated_round = self.round_serial;
+        const rising = !mutable_group.previous_clock and clock;
+        mutable_group.previous_clock = clock;
+        if (rising) {
+            if (self.readInput(n, 1)) {
+                // Read outputs before the round commits, just like DFF data.
+                // Sample the whole word once, even if another counter is its
+                // source or DATA/LOAD also scheduled a lane in this round.
+                var loaded: u64 = 0;
+                const first = mutable_group.first.index();
+                for (self.nodes.items[first..][0..mutable_group.width], 0..) |lane, bit| {
+                    const source = self.nodeConst(lane.inputs[0]) orelse continue;
+                    if (source.value) loaded |= @as(u64, 1) << @intCast(bit);
+                }
+                mutable_group.count = loaded;
+            } else {
+                mutable_group.count +%= 1;
+                mutable_group.count &= counterMask(mutable_group.width);
+            }
+        }
     }
-    const node = try circuit.addNode(.and2, .{ .x = 0, .y = 0 });
-    try circuit.connectInput(node, 0, removed);
-    try circuit.connectInput(node, 1, removed);
-    try circuit.connectOutput(node, 0, removed);
-    try std.testing.expect(circuit.removeNet(removed));
-    for (circuit.nodes.get(node).?.connections) |connection| try std.testing.expect(connection == null);
-    for ([_][]const InterfacePort{ circuit.inputs.items, circuit.outputs.items }) |ports| {
-        try std.testing.expectEqual(@as(usize, 2), ports.len);
-        try std.testing.expect(ports[0].net == a);
-        try std.testing.expect(ports[1].net == b);
+
+    const group = &self.counter_groups.items[group_index];
+    const bit_index = node_index - group.first.index();
+    return group.count & (@as(u64, 1) << @intCast(bit_index)) != 0;
+}
+
+fn readInput(self: *const Circuit, n: *const Node, pin: usize) bool {
+    if (pin >= n.kind.inputCount()) return false;
+    const source = self.nodeConst(self.inputSource(n, pin)) orelse return false;
+    return source.value;
+}
+
+fn inputSource(self: *const Circuit, n: *const Node, pin: usize) NodeId {
+    if (n.kind != .counter) return n.inputs[pin];
+    const group_index = self.counterGroupIndex(n) orelse return .invalid;
+    const group = &self.counter_groups.items[group_index];
+    return switch (pin) {
+        0 => group.clock,
+        1 => group.load,
+        2 => n.inputs[0],
+        else => .invalid,
+    };
+}
+
+fn scheduleConsumers(self: *Circuit, queue: *std.ArrayListUnmanaged(NodeId), source_id: NodeId) void {
+    const source = source_id.index();
+    const start: usize = @intCast(self.fanout_offsets.items[source]);
+    const finish: usize = @intCast(self.fanout_offsets.items[source + 1]);
+
+    for (self.fanout.items[start..finish]) |target_id| {
+        const target = target_id.index();
+        if (self.queued.items[target]) continue;
+        self.queued.items[target] = true;
+        queue.appendAssumeCapacity(target_id);
     }
-    const replacement = try circuit.addNet();
-    try std.testing.expect(replacement.index == removed.index);
-    try circuit.connectInput(node, 0, replacement);
-    try std.testing.expectError(error.InvalidNet, circuit.connectInput(node, 0, removed));
-    try std.testing.expect(!circuit.removeNet(removed));
-    try std.testing.expect(circuit.nodes.get(node).?.connections[0] == replacement);
+}
+
+fn removeCounterGroup(self: *Circuit, group_index: usize) bool {
+    if (group_index >= self.counter_groups.items.len) return false;
+    const group = &self.counter_groups.items[group_index];
+    if (!group.alive) return false;
+
+    const first = group.first.index();
+    const end = first + @as(usize, group.width);
+    for (self.nodes.items[first..end]) |*lane| {
+        lane.alive = false;
+        lane.value = false;
+        lane.inputs = .{ .invalid, .invalid };
+        lane.previous_clock = false;
+    }
+
+    group.alive = false;
+    group.clock = .invalid;
+    group.load = .invalid;
+    group.count = 0;
+    group.previous_clock = false;
+    group.last_evaluated_round = 0;
+    self.clearDownstreamRange(first, end);
+    self.topology_dirty = true;
+    return true;
+}
+
+fn clearDownstreamRange(self: *Circuit, first: usize, end: usize) void {
+    for (self.nodes.items) |*candidate| {
+        if (!candidate.alive) continue;
+        // The second counter slot is metadata, never a signal reference.
+        const count = if (candidate.kind == .counter) 1 else candidate.kind.inputCount();
+        for (0..count) |pin| {
+            const source_id = candidate.inputs[pin];
+            if (source_id == .invalid) continue;
+            const source = source_id.index();
+            if (source >= first and source < end) candidate.inputs[pin] = .invalid;
+        }
+    }
+    for (self.counter_groups.items) |*group| {
+        if (!group.alive) continue;
+        for ([_]*NodeId{ &group.clock, &group.load }) |source_id| {
+            if (source_id.* == .invalid) continue;
+            const source = source_id.*.index();
+            if (source >= first and source < end) source_id.* = .invalid;
+        }
+    }
+}
+
+fn counterGroupIndex(self: *const Circuit, n: *const Node) ?usize {
+    if (n.kind != .counter or n.inputs[1] == .invalid) return null;
+    const group_index = n.inputs[1].index();
+    if (group_index >= self.counter_groups.items.len) return null;
+    if (!self.counter_groups.items[group_index].alive) return null;
+    return group_index;
+}
+
+fn counterMask(width: u8) u64 {
+    if (width == 64) return std.math.maxInt(u64);
+    return (@as(u64, 1) << @intCast(width)) - 1;
+}
+
+fn node(self: *Circuit, id: NodeId) ?*Node {
+    if (id == .invalid) return null;
+    const index = id.index();
+    if (index >= self.nodes.items.len) return null;
+    const n = &self.nodes.items[index];
+    if (!n.alive) return null;
+    return n;
+}
+
+fn nodeConst(self: *const Circuit, id: NodeId) ?*const Node {
+    if (id == .invalid) return null;
+    const index = id.index();
+    if (index >= self.nodes.items.len) return null;
+    const n = &self.nodes.items[index];
+    if (!n.alive) return null;
+    return n;
+}
+
+fn counterLane(first: NodeId, offset: usize) NodeId {
+    return @enumFromInt(@intFromEnum(first) + @as(u32, @intCast(offset)));
+}
+
+fn expectCounterValue(circuit: *const Circuit, first: NodeId, width: usize, expected: u64) !void {
+    for (0..width) |bit_index| {
+        const bit = @as(u64, 1) << @intCast(bit_index);
+        try std.testing.expectEqual(expected & bit != 0, try circuit.value(counterLane(first, bit_index)));
+    }
+}
+
+fn expectSettled(circuit: *Circuit) !void {
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(256));
+}
+
+fn pulseClock(circuit: *Circuit, clock: NodeId) !void {
+    try circuit.setInput(clock, false);
+    try expectSettled(circuit);
+    try circuit.setInput(clock, true);
+    try expectSettled(circuit);
+}
+
+test "fanout uses direct source-to-input connections" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const a = try circuit.addNode(.input);
+    const b = try circuit.addNode(.input);
+    const and_gate = try circuit.addNode(.and2);
+    const first_out = try circuit.addNode(.output);
+    const second_out = try circuit.addNode(.output);
+
+    try circuit.connect(a, and_gate, 0);
+    try circuit.connect(b, and_gate, 1);
+    try circuit.connect(and_gate, first_out, 0);
+    try circuit.connect(and_gate, second_out, 0);
+
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(false, try circuit.value(first_out));
+    try std.testing.expectEqual(false, try circuit.value(second_out));
+
+    try circuit.setInput(a, true);
+    try circuit.setInput(b, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(true, try circuit.value(first_out));
+    try std.testing.expectEqual(true, try circuit.value(second_out));
+}
+
+test "additional combinational gates evaluate expected truth table" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const a = try circuit.addNode(.input);
+    const b = try circuit.addNode(.input);
+    const buffer = try circuit.addNode(.buffer);
+    const nand = try circuit.addNode(.nand2);
+    const nor = try circuit.addNode(.nor2);
+    const xnor = try circuit.addNode(.xnor2);
+
+    try circuit.connect(a, buffer, 0);
+    for ([_]NodeId{ nand, nor, xnor }) |gate| {
+        try circuit.connect(a, gate, 0);
+        try circuit.connect(b, gate, 1);
+    }
+
+    const Case = struct { a: bool, b: bool, nand: bool, nor: bool, xnor: bool };
+    for ([_]Case{
+        .{ .a = false, .b = false, .nand = true, .nor = true, .xnor = true },
+        .{ .a = false, .b = true, .nand = true, .nor = false, .xnor = false },
+        .{ .a = true, .b = false, .nand = true, .nor = false, .xnor = false },
+        .{ .a = true, .b = true, .nand = false, .nor = false, .xnor = true },
+    }) |case| {
+        try circuit.setInput(a, case.a);
+        try circuit.setInput(b, case.b);
+        try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+        try std.testing.expectEqual(case.a, try circuit.value(buffer));
+        try std.testing.expectEqual(case.nand, try circuit.value(nand));
+        try std.testing.expectEqual(case.nor, try circuit.value(nor));
+        try std.testing.expectEqual(case.xnor, try circuit.value(xnor));
+    }
+}
+
+test "editing leaves a usable incomplete circuit" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const source = try circuit.addNode(.input);
+    const inverter = try circuit.addNode(.not);
+    const out = try circuit.addNode(.output);
+    try circuit.connect(source, inverter, 0);
+    try circuit.connect(inverter, out, 0);
+
+    try circuit.setInput(source, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(false, try circuit.value(out));
+
+    try std.testing.expect(circuit.removeNode(source));
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    // A disconnected input reads false, so NOT produces true while editing.
+    try std.testing.expectEqual(true, try circuit.value(out));
+    try std.testing.expect(!circuit.removeNode(source));
+}
+
+test "round budget reports pending and resumes" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const input = try circuit.addNode(.input);
+    const first = try circuit.addNode(.not);
+    const second = try circuit.addNode(.not);
+    const out = try circuit.addNode(.output);
+    try circuit.connect(input, first, 0);
+    try circuit.connect(first, second, 0);
+    try circuit.connect(second, out, 0);
+
+    try std.testing.expectEqual(RunResult.pending, try circuit.run(1));
+    try std.testing.expectEqual(RunResult.pending, try circuit.run(1));
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(false, try circuit.value(out));
+}
+
+test "steady state input changes allocate nothing" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var circuit = Circuit.init(failing.allocator());
+    defer circuit.deinit();
+
+    const a = try circuit.addNode(.input);
+    const b = try circuit.addNode(.input);
+    const gate = try circuit.addNode(.xor2);
+    try circuit.connect(a, gate, 0);
+    try circuit.connect(b, gate, 1);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    try circuit.setInput(a, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try circuit.setInput(b, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(false, try circuit.value(gate));
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "dffs sample the same old state on a rising edge" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const d = try circuit.addNode(.input);
+    const clock = try circuit.addNode(.input);
+    const first = try circuit.addNode(.dff);
+    const second = try circuit.addNode(.dff);
+    try circuit.connect(d, first, 0);
+    try circuit.connect(clock, first, 1);
+    try circuit.connect(first, second, 0);
+    try circuit.connect(clock, second, 1);
+
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try circuit.setInput(d, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+
+    try circuit.setInput(clock, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(true, try circuit.value(first));
+    try std.testing.expectEqual(false, try circuit.value(second));
+
+    try circuit.setInput(clock, false);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try circuit.setInput(clock, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(true, try circuit.value(second));
+}
+
+test "topology edits do not swallow a pending dff rising edge" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const data = try circuit.addNode(.input);
+    const clock = try circuit.addNode(.input);
+    const dff = try circuit.addNode(.dff);
+    try circuit.connect(data, dff, 0);
+    try circuit.connect(clock, dff, 1);
+
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try circuit.setInput(data, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+
+    try circuit.setInput(clock, true);
+    _ = try circuit.addNode(.output);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(true, try circuit.value(dff));
+}
+
+test "combinational oscillator remains pending" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const inverter = try circuit.addNode(.not);
+    try circuit.connect(inverter, inverter, 0);
+
+    try std.testing.expectEqual(RunResult.pending, try circuit.run(16));
+    try std.testing.expectEqual(RunResult.pending, try circuit.run(16));
+}
+
+test "node ids are simple monotonic u32 values" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const a = try circuit.addNode(.input);
+    const b = try circuit.addNode(.not);
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(a));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(b));
+    try std.testing.expect(circuit.removeNode(a));
+
+    const c = try circuit.addNode(.output);
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(c));
+    try std.testing.expectError(error.InvalidNode, circuit.connect(a, c, 0));
+}
+
+test "checkpoint retains dff output and clock history without a new edge" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+    const data = try circuit.addNode(.input);
+    const clock = try circuit.addNode(.input);
+    const flop = try circuit.addNode(.dff);
+    try circuit.connect(data, flop, 0);
+    try circuit.connect(clock, flop, 1);
+    try circuit.setInput(clock, true);
+    try circuit.restoreState(flop, 3);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(true, try circuit.value(flop));
+    try std.testing.expectEqual(@as(u2, 3), try circuit.state(flop));
+    try circuit.setInput(clock, false);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try circuit.setInput(clock, true);
+    try std.testing.expectEqual(RunResult.settled, try circuit.run(8));
+    try std.testing.expectEqual(false, try circuit.value(flop));
+    try std.testing.expectEqual(@as(u2, 2), try circuit.state(flop));
+    try std.testing.expectError(error.InvalidNode, circuit.state(.invalid));
+    try std.testing.expectError(error.InvalidNode, circuit.restoreState(.invalid, 0));
+}
+
+test "three bit counter rolls over and accepts clock on any lane" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const clock = try circuit.addNode(.input);
+    const counter = try circuit.addCounter(3);
+    try circuit.connect(clock, counterLane(counter, 1), 0);
+    try expectSettled(&circuit);
+
+    for (1..9) |step| {
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, counter, 3, @intCast(step & 7));
+        for (0..3) |bit_index| {
+            const saved = try circuit.state(counterLane(counter, bit_index));
+            try std.testing.expect(saved & 2 != 0);
+        }
+    }
+}
+
+test "setting counter value preserves clock history and schedules changed outputs" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+    const clock = try circuit.addNode(.input);
+    const counter = try circuit.addCounter(3);
+    const out = try circuit.addNode(.output);
+    try circuit.connect(clock, counter, 0);
+    try circuit.connect(counterLane(counter, 2), out, 0);
+    try expectSettled(&circuit);
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try circuit.setCounter(counterLane(counter, 1), 7);
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 3, 7);
+    try std.testing.expectEqual(true, try circuit.value(out));
+    try std.testing.expectEqual(@as(u2, 3), try circuit.state(counter));
+    try circuit.setInput(clock, false);
+    try expectSettled(&circuit);
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 3, 0);
+    try std.testing.expectEqual(false, try circuit.value(out));
+    try std.testing.expectError(error.ValueOutOfRange, circuit.setCounter(counter, 8));
+    try std.testing.expectError(error.NotCounter, circuit.setCounter(clock, 0));
+    try std.testing.expectError(error.InvalidNode, circuit.setCounter(.invalid, 0));
+    const wide = try circuit.addCounter(64);
+    try circuit.setCounter(wide, std.math.maxInt(u64));
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, wide, 64, std.math.maxInt(u64));
+}
+
+test "sixty four bit counter carries and rolls over from restored state" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const clock = try circuit.addNode(.input);
+    const counter = try circuit.addCounter(64);
+    try circuit.connect(clock, counterLane(counter, 63), 0);
+
+    for (0..64) |bit_index| {
+        const saved: u2 = if (bit_index < 63) 1 else 0;
+        try circuit.restoreState(counterLane(counter, bit_index), saved);
+    }
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 64, std.math.maxInt(u64) >> 1);
+
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 64, @as(u64, 1) << 63);
+
+    try circuit.setInput(clock, false);
+    try expectSettled(&circuit);
+    for (0..64) |bit_index| {
+        try circuit.restoreState(counterLane(counter, bit_index), 1);
+    }
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 64, std.math.maxInt(u64));
+
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 64, 0);
+}
+
+test "held high counter clock survives topology rebuild without a new edge" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const clock = try circuit.addNode(.input);
+    const counter = try circuit.addCounter(4);
+    try circuit.connect(clock, counterLane(counter, 2), 0);
+    try expectSettled(&circuit);
+
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 4, 1);
+
+    const mirror = try circuit.addNode(.output);
+    try circuit.connect(counter, mirror, 0);
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 4, 1);
+    try std.testing.expectEqual(true, try circuit.value(mirror));
+}
+
+test "counter and dff commit together on a shared rising edge" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const clock = try circuit.addNode(.input);
+    const counter = try circuit.addCounter(2);
+    const dff = try circuit.addNode(.dff);
+    try circuit.connect(clock, counter, 0);
+    try circuit.connect(counter, dff, 0);
+    try circuit.connect(clock, dff, 1);
+    try expectSettled(&circuit);
+
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 2, 1);
+    try std.testing.expectEqual(false, try circuit.value(dff));
+
+    try circuit.setInput(clock, false);
+    try expectSettled(&circuit);
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 2, 2);
+    try std.testing.expectEqual(true, try circuit.value(dff));
+}
+
+test "steady state counter clock toggles allocate nothing" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var circuit = Circuit.init(failing.allocator());
+    defer circuit.deinit();
+
+    const clock = try circuit.addNode(.input);
+    const counter = try circuit.addCounter(64);
+    try circuit.connect(clock, counterLane(counter, 31), 0);
+    try expectSettled(&circuit);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    for (0..32) |step| {
+        try circuit.setInput(clock, step & 1 == 0);
+        try expectSettled(&circuit);
+    }
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "counter allocation is transactional when node reservation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var circuit = Circuit.init(failing.allocator());
+    defer circuit.deinit();
+
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, circuit.addCounter(8));
+    try std.testing.expectEqual(@as(usize, 0), circuit.nodes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), circuit.counter_groups.items.len);
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "removing one counter lane removes the group and clears consumers" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const initial_node_count = circuit.nodes.items.len;
+    try std.testing.expectError(error.InvalidWidth, circuit.addCounter(0));
+    try std.testing.expectError(error.InvalidWidth, circuit.addCounter(65));
+    try std.testing.expectEqual(initial_node_count, circuit.nodes.items.len);
+
+    const clock = try circuit.addNode(.input);
+    const counter = try circuit.addCounter(3);
+    const low_out = try circuit.addNode(.output);
+    const high_out = try circuit.addNode(.output);
+    try circuit.connect(clock, counterLane(counter, 2), 0);
+    try std.testing.expect(circuit.disconnect(counter, 0));
+    try std.testing.expect(!circuit.disconnect(counterLane(counter, 1), 0));
+    try circuit.connect(clock, counterLane(counter, 1), 0);
+    try circuit.connect(counter, low_out, 0);
+    try circuit.connect(counterLane(counter, 2), high_out, 0);
+    try expectSettled(&circuit);
+    try pulseClock(&circuit, clock);
+    try std.testing.expectEqual(true, try circuit.value(low_out));
+
+    try std.testing.expect(circuit.removeNode(counterLane(counter, 1)));
+    for (0..3) |bit_index| {
+        const lane = counterLane(counter, bit_index);
+        try std.testing.expectError(error.InvalidNode, circuit.value(lane));
+        try std.testing.expectError(error.InvalidNode, circuit.state(lane));
+        try std.testing.expectError(error.InvalidNode, circuit.restoreState(lane, 0));
+    }
+    try std.testing.expectError(error.InvalidNode, circuit.connect(clock, counter, 0));
+    try expectSettled(&circuit);
+    try std.testing.expectEqual(false, try circuit.value(low_out));
+    try std.testing.expectEqual(false, try circuit.value(high_out));
+    try std.testing.expect(!circuit.removeNode(counter));
+
+    const single = try circuit.addNode(.counter);
+    try std.testing.expectEqual(Kind.counter, circuit.nodes.items[single.index()].kind);
+    try std.testing.expectEqual(false, try circuit.value(single));
+}
+
+test "counter loads another chip's complete word only on rising edges" {
+    for ([_]usize{ 1, 3, 32, 64 }) |width| {
+        var circuit = Circuit.init(std.testing.allocator);
+        defer circuit.deinit();
+        const clock = try circuit.addNode(.input);
+        const load = try circuit.addNode(.input);
+        const data = try circuit.addCounter(width);
+        const counter = try circuit.addCounter(width);
+        // Shared controls may be connected through any output lane.
+        try circuit.connect(clock, counterLane(counter, width - 1), 0);
+        try circuit.connect(load, counterLane(counter, width - 1), 1);
+        for (0..width) |bit| try circuit.connect(counterLane(data, bit), counterLane(counter, bit), 2);
+        const pattern = (@as(u64, 1) << @intCast(width - 1)) | 1;
+        try circuit.setCounter(data, pattern);
+        try circuit.setInput(load, true);
+        try expectSettled(&circuit);
+        try expectCounterValue(&circuit, counter, width, 0);
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, counter, width, pattern);
+
+        try circuit.setCounter(data, 0);
+        try expectSettled(&circuit);
+        try circuit.setInput(load, false);
+        try expectSettled(&circuit);
+        try expectCounterValue(&circuit, counter, width, pattern);
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, counter, width, (pattern +% 1) & counterMask(@intCast(width)));
+
+        try circuit.setInput(load, true);
+        try expectSettled(&circuit);
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, counter, width, 0);
+        try circuit.setCounter(data, counterMask(@intCast(width)));
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, counter, width, counterMask(@intCast(width)));
+        try circuit.setInput(load, false);
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, counter, width, 0);
+    }
+}
+
+test "counter loading and dff sampling use the old outputs in either creation order" {
+    for ([_]bool{ false, true }) |reverse| {
+        var circuit = Circuit.init(std.testing.allocator);
+        defer circuit.deinit();
+        const clock = try circuit.addNode(.input);
+        const load = try circuit.addNode(.input);
+        const first = try circuit.addCounter(3);
+        const second = try circuit.addCounter(3);
+        const source = if (reverse) second else first;
+        const target = if (reverse) first else second;
+        const flop = try circuit.addNode(.dff);
+        try circuit.connect(clock, source, 0);
+        try circuit.connect(clock, target, 0);
+        try circuit.connect(load, target, 1);
+        for (0..3) |bit| try circuit.connect(counterLane(source, bit), counterLane(target, bit), 2);
+        try circuit.connect(target, flop, 0);
+        try circuit.connect(clock, flop, 1);
+        try circuit.setInput(load, true);
+        try circuit.setCounter(source, 3);
+        try expectSettled(&circuit);
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, source, 3, 4);
+        try expectCounterValue(&circuit, target, 3, 3);
+        try std.testing.expectEqual(false, try circuit.value(flop));
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, source, 3, 5);
+        try expectCounterValue(&circuit, target, 3, 4);
+        try std.testing.expectEqual(true, try circuit.value(flop));
+    }
+}
+
+test "removing load or data sources preserves counter metadata and clears shared controls" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+    // This node id intentionally equals the first counter's group index.
+    const data = try circuit.addNode(.input);
+    const load = try circuit.addNode(.input);
+    const clock = try circuit.addNode(.input);
+    const counter = try circuit.addCounter(3);
+    try circuit.connect(clock, counter, 0);
+    try circuit.connect(load, counterLane(counter, 2), 1);
+    for (0..3) |bit| try circuit.connect(data, counterLane(counter, bit), 2);
+    try circuit.setInput(data, true);
+    try circuit.setInput(load, true);
+    try pulseClock(&circuit, clock);
+    try expectCounterValue(&circuit, counter, 3, 7);
+    try std.testing.expect(circuit.removeNode(data));
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 3, 7);
+    try pulseClock(&circuit, clock);
+    try expectCounterValue(&circuit, counter, 3, 0);
+    try std.testing.expect(circuit.removeNode(load));
+    try std.testing.expect(!circuit.disconnect(counter, 1));
+    try pulseClock(&circuit, clock);
+    try expectCounterValue(&circuit, counter, 3, 1);
+    try std.testing.expect(circuit.removeNode(clock));
+    try std.testing.expect(!circuit.disconnect(counterLane(counter, 2), 0));
+    try expectSettled(&circuit);
+    try expectCounterValue(&circuit, counter, 3, 1);
+    try std.testing.expectError(error.InvalidPin, circuit.connect(counter, counter, 3));
+    try std.testing.expect(!circuit.disconnect(counter, 3));
+}
+
+test "counter lane data disconnect is local and deleting a source group clears load" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+    const source = try circuit.addCounter(2);
+    const target = try circuit.addCounter(3);
+    const clock = try circuit.addNode(.input);
+    try circuit.connect(clock, target, 0);
+    try circuit.connect(source, target, 1);
+    for (0..3) |bit| try circuit.connect(source, counterLane(target, bit), 2);
+    try circuit.setCounter(source, 1);
+    try pulseClock(&circuit, clock);
+    try expectCounterValue(&circuit, target, 3, 7);
+    try std.testing.expect(circuit.disconnect(counterLane(target, 1), 2));
+    try std.testing.expect(!circuit.disconnect(counterLane(target, 1), 2));
+    try pulseClock(&circuit, clock);
+    try expectCounterValue(&circuit, target, 3, 5);
+    try std.testing.expect(circuit.removeNode(counterLane(source, 1)));
+    try std.testing.expect(!circuit.disconnect(target, 1));
+    try std.testing.expect(!circuit.disconnect(counterLane(target, 2), 2));
+    try pulseClock(&circuit, clock);
+    try expectCounterValue(&circuit, target, 3, 6);
+}
+
+test "counter load and increment reuse storage after topology preparation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var circuit = Circuit.init(failing.allocator());
+    defer circuit.deinit();
+    const clock = try circuit.addNode(.input);
+    const load = try circuit.addNode(.input);
+    const source = try circuit.addCounter(64);
+    const target = try circuit.addCounter(64);
+    try circuit.connect(clock, target, 0);
+    try circuit.connect(load, target, 1);
+    for (0..64) |bit| try circuit.connect(counterLane(source, bit), counterLane(target, bit), 2);
+    try expectSettled(&circuit);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    for (0..16) |step| {
+        const pattern = (@as(u64, 1) << 63) | @as(u64, @intCast(step));
+        try circuit.setCounter(source, pattern);
+        try circuit.setInput(load, true);
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, target, 64, pattern);
+        try circuit.setInput(load, false);
+        try pulseClock(&circuit, clock);
+        try expectCounterValue(&circuit, target, 64, pattern + 1);
+    }
+    try std.testing.expect(!failing.has_induced_failure);
 }
