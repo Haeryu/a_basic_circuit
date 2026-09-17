@@ -1,7 +1,8 @@
-import { META, MAX_WIDTH, MAX_ADDRESS_WIDTH, validWidth, maskValue, bitValue, busValue,
+import { META, MAX_WIDTH, MAX_ADDRESS_WIDTH, MAX_RAM_ADDRESS_WIDTH, validWidth, maskValue, bitValue, busValue,
   makeNode, inputDefs, outputDefs, ensureInputSlots, connectionProblem, createDefinition, inferDefinitionSelection,
   resolveCustom, changeCustomWidth, compileCircuit, readBus, setRuntimeInput, setRuntimeCounter, resizeDisplay,
-  parseInputValue, formatBusValue, setSemanticWasm } from "./circuit.js";
+  parseInputValue, formatBusValue, ramAddressLimit, cloneRamCells, setRamRange, setRamImageCell,
+  readRuntimeRamCell, setRuntimeRamCell, snapshotRuntimeRamStates, setSemanticWasm } from "./circuit.js";
 import { ClockScheduler, validClockHz, toggleClockLevel, MIN_CLOCK_HZ, MAX_CLOCK_HZ } from "./clock.js";
 import { serializeSelection, deserializeSelection, serializeChipBundle, deserializeChipBundle } from "./clipboard.js";
 import { autoLayout, routeWire } from "./routing.js";
@@ -63,6 +64,7 @@ const editHistory = new DocumentHistory();
 let historyReady = false;
 let applyingHistory = false;
 const retainedStates = new Map();
+const retainedRamStates = new Map();
 const retainedOscillators = new Map();
 let projectFileName = "circuit.abc.json";
 const view = { x: 0, y: 0, zoom: 1 };
@@ -92,6 +94,7 @@ function materializeDefinition(definition) {
     const node = makeNode(spec.localId, spec.kind, spec.x ?? 0, spec.y ?? 0, spec.width, spec.definitionId ?? null);
     Object.assign(node, spec, { documentId: spec.localId, inputs: (spec.inputs ?? []).map((c) => c && { ...c }),
       widthParameters: { ...(spec.widthParameters ?? {}) }, inputValue: spec.inputValue ?? 0n });
+    if (node.kind === "ram") node.ramCells = cloneRamCells(spec.ramCells);
     ensureInputSlots(node, definitionById);
     return node;
   });
@@ -172,8 +175,12 @@ function liveStates() {
   }
   return states;
 }
+function liveRamStates() {
+  return runtime ? snapshotRuntimeRamStates(wasm, runtime) : new Map();
+}
 function rememberRuntime() {
   for (const [key, value] of liveStates()) retainedStates.set(key, value);
+  for (const [key, cells] of liveRamStates()) retainedRamStates.set(key, cells);
   for (const node of rootNodes) if (node.kind === "oscillator") {
     retainedOscillators.set(node.documentId, { inputValue: node.inputValue, clockRunning: node.clockRunning });
   }
@@ -191,6 +198,7 @@ function recordEdit(options = {}) {
   if (editHistory.record(rootNodes, customDefinitions, historyOptions)) documentEpoch += 1;
   const ids = editHistory.referencedIds();
   for (const key of retainedStates.keys()) if (!ids.has(Number(key.slice(0, key.indexOf("/"))))) retainedStates.delete(key);
+  for (const key of retainedRamStates.keys()) if (!ids.has(Number(key.slice(0, key.indexOf("/"))))) retainedRamStates.delete(key);
   for (const id of retainedOscillators.keys()) if (!ids.has(id)) retainedOscillators.delete(id);
   updateHistoryControls();
 }
@@ -288,6 +296,7 @@ function applyEditHistory(redo = false) {
       if (current && !result.changedIds.has(saved.documentId)) return current;
       const node = Object.assign(makeNode(saved.documentId, saved.kind, saved.x, saved.y, saved.width, saved.definitionId), saved,
         { inputs: saved.inputs.map((c) => c && { ...c }), widthParameters: { ...saved.widthParameters } });
+      if (node.kind === "ram") node.ramCells = cloneRamCells(saved.ramCells);
       if (node.kind === "oscillator") Object.assign(node, retainedOscillators.get(node.documentId) ?? {});
       return node;
     });
@@ -312,7 +321,11 @@ function saveProjectFile() {
   if (!wasm) return;
   cancelGesture(); document.activeElement?.blur();
   try {
-    const text = serializeProject(rootNodes, customDefinitions, { view: { ...(scopeViews.get("root") ?? view) }, states: liveStates() });
+    const text = serializeProject(rootNodes, customDefinitions, {
+      view: { ...(scopeViews.get("root") ?? view) },
+      states: liveStates(),
+      ramStates: liveRamStates(),
+    });
     const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
     const link = document.createElement("a"); link.href = url; link.download = projectFileName;
     document.body.append(link); link.click(); link.remove();
@@ -389,7 +402,9 @@ async function openProjectFile(file) {
     rootNodes = loaded.nodes; customDefinitions = loaded.definitions;
     nextDocumentId = loaded.nextDocumentId; nextDefinitionId = loaded.nextDefinitionId;
     scopePath = []; setActiveNodes(rootNodes); selectedIds.clear(); selectedWire = null; activeNodeId = null; runtime = null;
+    retainedStates.clear(); retainedRamStates.clear(); retainedOscillators.clear();
     for (const [key, value] of loaded.states) retainedStates.set(key, value);
+    for (const [key, cells] of loaded.ramStates) retainedRamStates.set(key, cells);
     scopeViews.set("root", { ...loaded.view }); Object.assign(view, loaded.view); projectFileName = file.name;
     documentEpoch += 1; clocks.sync([], performance.now());
     rebuildRuntime({ commitScope: false });
@@ -643,7 +658,7 @@ function rebuildRuntime({ commitScope = true, record = true } = {}) {
   if (selectedWire && !nodeById(selectedWire.targetId)?.inputs[selectedWire.pin]) selectedWire = null;
   try {
     for (const node of rootNodes) ensureInputSlots(node, definitionById);
-    runtime = compileCircuit(wasm, rootNodes, customDefinitions, runtime, retainedStates);
+    runtime = compileCircuit(wasm, rootNodes, customDefinitions, runtime, retainedStates, retainedRamStates);
     render(); runSimulation();
   } catch (error) {
     runtime = null;
@@ -729,6 +744,16 @@ function updateSignals() {
         level.classList.toggle("on", Boolean(node.inputValue));
       }
     }
+    if (node.kind === "ram") {
+      for (const input of el.querySelectorAll(".ram-cell-value")) {
+        const address = BigInt(input.dataset.address);
+        if (document.activeElement !== input) {
+          input.value = formatBusValue(displayedRamCell(node, address), node.width, 16);
+          input.classList.remove("invalid");
+        }
+        input.disabled = simulationRunning;
+      }
+    }
   }
   for (const group of dom.wireLayer.querySelectorAll(".wire-group")) {
     const c = nodeById(Number(group.dataset.targetId))?.inputs[Number(group.dataset.pin)];
@@ -792,12 +817,35 @@ function loadDemo() {
 function changeWidth(node, field, value) {
   const split = node.kind === "split" || node.kind === "join";
   const min = field === "width" && split ? 2 : 1;
-  const max = field === "addressWidth" ? MAX_ADDRESS_WIDTH : field === "splitWidth" ? node.width - 1 : MAX_WIDTH;
+  const max = field === "addressWidth"
+    ? node.kind === "ram" ? MAX_RAM_ADDRESS_WIDTH : MAX_ADDRESS_WIDTH
+    : field === "splitWidth" ? node.width - 1 : MAX_WIDTH;
   if (!validWidth(value, min, max)) throw new Error(`Width must be an integer from ${min} to ${max}`);
+  if (node.kind === "ram" && field === "addressWidth") {
+    const oldLimit = ramAddressLimit(node.addressWidth);
+    const newLimit = ramAddressLimit(value);
+    const base = node.ramBase ?? 0n, end = node.ramEnd ?? oldLimit;
+    if (!(base === 0n && end === oldLimit) && end > newLimit) {
+      throw new Error(`Mapped range does not fit a ${value}-bit RAM address bus`);
+    }
+    node.addressWidth = value;
+    setRamRange(node, base === 0n && end === oldLimit ? 0n : base,
+      base === 0n && end === oldLimit ? newLimit : end);
+    rebuildRuntime();
+    return;
+  }
   node[field] = value;
   if (field === "width") {
     node.inputValue = maskValue(node.inputValue, value);
     if (split) node.splitWidth = Math.min(node.splitWidth, value - 1);
+    if (node.kind === "ram") {
+      const cells = new Map();
+      for (const [address, word] of cloneRamCells(node.ramCells)) {
+        const masked = maskValue(word, value);
+        if (masked !== 0n) cells.set(address, masked);
+      }
+      node.ramCells = cells;
+    }
   }
   rebuildRuntime();
 }
@@ -868,7 +916,9 @@ function widthFields(node) {
   const add = (label, field, min, max) => fields.push({ label, field, value: node[field], min, max,
     apply: (value) => changeWidth(node, field, value) });
   if (node.kind !== "decoder") add(split ? "Total" : "Data", "width", split ? 2 : 1, MAX_WIDTH);
-  if (["mux", "demux", "decoder", "ram"].includes(node.kind)) add("Address", "addressWidth", 1, MAX_ADDRESS_WIDTH);
+  if (["mux", "demux", "decoder", "ram"].includes(node.kind)) {
+    add("Address", "addressWidth", 1, node.kind === "ram" ? MAX_RAM_ADDRESS_WIDTH : MAX_ADDRESS_WIDTH);
+  }
   if (split) add("Low bits", "splitWidth", 1, node.width - 1);
   return fields;
 }
@@ -890,6 +940,7 @@ function updateWidthControls(settings, node) {
   }
   for (const input of existing.values()) input.closest(".width-control").remove();
   if (node.kind === "display") updateLedControls(settings, node);
+  if (node.kind === "ram") updateRamMapControls(settings, node);
 }
 function updateLedControls(settings, node) {
   let controls = settings.querySelector(".led-controls");
@@ -919,6 +970,121 @@ function updateLedControls(settings, node) {
   controls.querySelector(".led-colors").hidden = node.ledMode === "rgb";
   controls.querySelector(".led-color").value = node.ledColor;
   for (const button of controls.querySelectorAll(".color-swatch")) button.setAttribute("aria-pressed", String(button.dataset.color === node.ledColor));
+}
+
+function updateRamMapControls(settings, node) {
+  let controls = settings.querySelector(".ram-map-controls");
+  if (!controls) {
+    controls = document.createElement("div"); controls.className = "ram-map-controls";
+    controls.addEventListener("pointerdown", (event) => event.stopPropagation());
+    const make = (label, field) => {
+      const wrapper = document.createElement("label"); wrapper.className = "ram-map-control";
+      const caption = document.createElement("span"); caption.textContent = label;
+      const input = document.createElement("input"); input.type = "text"; input.spellcheck = false;
+      input.className = "ram-map-input"; input.dataset.ramMap = field;
+      input.setAttribute("aria-label", `RAM ${label.toLowerCase()} #${node.documentId}`);
+      input.title = "Decimal, 0x hexadecimal, 0b binary or 0o octal; Enter to apply";
+      input.addEventListener("keydown", (event) => { if (event.key === "Enter") input.blur(); });
+      input.addEventListener("change", () => {
+        const start = controls.querySelector('[data-ram-map="start"]');
+        const end = controls.querySelector('[data-ram-map="end"]');
+        try {
+          const base = parseInputValue(start.value, node.addressWidth).value;
+          const last = parseInputValue(end.value, node.addressWidth).value;
+          setRamRange(node, base, last);
+          node.ramPageAddress = base;
+          rebuildRuntime();
+        } catch (error) {
+          start.value = formatBusValue(node.ramBase, node.addressWidth, 16);
+          end.value = formatBusValue(node.ramEnd, node.addressWidth, 16);
+          setStatus("error", error.message);
+        }
+      });
+      wrapper.append(caption, input); controls.append(wrapper);
+    };
+    make("Range start", "start"); make("Range end", "end"); settings.append(controls);
+  }
+  const start = controls.querySelector('[data-ram-map="start"]');
+  const end = controls.querySelector('[data-ram-map="end"]');
+  if (document.activeElement !== start) start.value = formatBusValue(node.ramBase, node.addressWidth, 16);
+  if (document.activeElement !== end) end.value = formatBusValue(node.ramEnd, node.addressWidth, 16);
+}
+
+const RAM_PAGE_ROWS = 8n;
+function ramPageStart(node) {
+  const base = node.ramBase ?? 0n, end = node.ramEnd ?? ramAddressLimit(node.addressWidth);
+  let start = typeof node.ramPageAddress === "bigint" ? node.ramPageAddress : base;
+  if (start < base) start = base;
+  if (start > end) start = end;
+  node.ramPageAddress = start;
+  return start;
+}
+function displayedRamCell(node, address) {
+  const handle = !inDefinitionScope() ? runtimeHandleForNode(node.documentId) : null;
+  if (handle && runtime) return readRuntimeRamCell(wasm, handle, address);
+  if (node.ramCells instanceof Map) return node.ramCells.get(address) ?? 0n;
+  return cloneRamCells(node.ramCells).get(address) ?? 0n;
+}
+function editRamCell(node, address, text) {
+  const { value } = parseInputValue(text, node.width);
+  const handle = !inDefinitionScope() ? runtimeHandleForNode(node.documentId) : null;
+  if (handle && runtime) {
+    setRuntimeRamCell(wasm, handle, node, address, value);
+    recordEdit(); runSimulation();
+  } else {
+    setRamImageCell(node, address, value);
+    rebuildRuntime();
+  }
+}
+function createRamEditor(node) {
+  const editor = document.createElement("div"); editor.className = "ram-editor";
+  editor.addEventListener("pointerdown", (event) => event.stopPropagation());
+  const base = node.ramBase ?? 0n, end = node.ramEnd ?? ramAddressLimit(node.addressWidth);
+  const start = ramPageStart(node);
+  const controls = document.createElement("div"); controls.className = "ram-page-controls";
+  const previous = document.createElement("button"); previous.type = "button"; previous.className = "ram-page-button"; previous.textContent = "‹";
+  previous.title = "Previous memory page"; previous.disabled = start <= base;
+  previous.addEventListener("click", () => { node.ramPageAddress = start - RAM_PAGE_ROWS < base ? base : start - RAM_PAGE_ROWS; render(); });
+  const jump = document.createElement("input"); jump.type = "text"; jump.spellcheck = false; jump.className = "ram-page-address";
+  jump.value = formatBusValue(start, node.addressWidth, 16); jump.setAttribute("aria-label", `RAM page address #${node.documentId}`);
+  jump.title = "Jump to mapped address";
+  jump.addEventListener("keydown", (event) => { if (event.key === "Enter") jump.blur(); });
+  jump.addEventListener("change", () => {
+    try {
+      const address = parseInputValue(jump.value, node.addressWidth).value;
+      if (address < base || address > end) throw new Error("Page address is outside the RAM mapped range");
+      node.ramPageAddress = address; render();
+    } catch (error) {
+      jump.value = formatBusValue(start, node.addressWidth, 16); setStatus("error", error.message);
+    }
+  });
+  const next = document.createElement("button"); next.type = "button"; next.className = "ram-page-button"; next.textContent = "›";
+  next.title = "Next memory page"; next.disabled = start + RAM_PAGE_ROWS > end;
+  next.addEventListener("click", () => { node.ramPageAddress = start + RAM_PAGE_ROWS > end ? end : start + RAM_PAGE_ROWS; render(); });
+  controls.append(previous, jump, next); editor.append(controls);
+
+  const cells = document.createElement("div"); cells.className = "ram-cells";
+  const remaining = end - start + 1n;
+  const rowCount = Number(remaining < RAM_PAGE_ROWS ? remaining : RAM_PAGE_ROWS);
+  for (let offset = 0; offset < rowCount; offset += 1) {
+    const address = start + BigInt(offset);
+    const row = document.createElement("label"); row.className = "ram-cell-row";
+    const addressLabel = document.createElement("span"); addressLabel.className = "ram-cell-address";
+    addressLabel.textContent = formatBusValue(address, node.addressWidth, 16);
+    const value = document.createElement("input"); value.type = "text"; value.spellcheck = false; value.className = "ram-cell-value";
+    value.dataset.address = address.toString(10); value.value = formatBusValue(displayedRamCell(node, address), node.width, 16);
+    value.setAttribute("aria-label", `RAM ${addressLabel.textContent} value #${node.documentId}`);
+    value.title = "Memory word: decimal, 0x hexadecimal, 0b binary or 0o octal";
+    value.addEventListener("keydown", (event) => { if (event.key === "Enter") value.blur(); });
+    value.addEventListener("change", () => {
+      try { editRamCell(node, address, value.value); value.classList.remove("invalid"); }
+      catch (error) { value.classList.add("invalid"); setStatus("error", error.message); }
+    });
+    row.append(addressLabel, value); cells.append(row);
+  }
+  const note = document.createElement("div"); note.className = "ram-map-note";
+  note.textContent = "Outside map: read 0 · simulated writes ignored";
+  editor.append(cells, note); return editor;
 }
 function bitGrid(node, interactive) {
   const grid = document.createElement("div"); grid.className = "led-grid";
@@ -994,7 +1160,8 @@ function createNodeElement(node, layout) {
 }
 function createNodeBody(node, { ins, outs }) {
   const body = document.createElement("div"); body.className = "node-body";
-  const portHeight = Math.max(74, (Math.max(ins.length, outs.length) + 1) * 28);
+  const portHeight = node.kind === "ram" ? Math.max(286, (Math.max(ins.length, outs.length) + 1) * 28)
+    : Math.max(74, (Math.max(ins.length, outs.length) + 1) * 28);
   const counterHeader = node.kind === "clock" ? 44 : 0;
   const portTop = (index, count) => counterHeader ? `${counterHeader + (index + 1) / (count + 1) * portHeight}px` : `${(index + 1) / (count + 1) * 100}%`;
   body.style.minHeight = `${counterHeader + portHeight}px`;
@@ -1027,6 +1194,8 @@ function createNodeBody(node, { ins, outs }) {
     pulse.setAttribute("aria-label", `Pulse oscillator #${node.documentId}`); pulse.addEventListener("click", () => pulseClock(node));
     for (const button of [toggle, pulse]) button.addEventListener("pointerdown", (event) => event.stopPropagation());
     actions.append(toggle, pulse); body.append(level, actions);
+  } else if (node.kind === "ram") {
+    body.classList.add("ram-body"); body.append(createRamEditor(node));
   } else if (["input", "output", "display"].includes(node.kind)) {
     body.classList.add("io-body"); body.append(bitGrid(node, node.kind === "input"));
     const value = document.createElement(node.kind === "input" ? "input" : "span"); value.className = "node-value";
@@ -1061,7 +1230,6 @@ function createNodeBody(node, { ins, outs }) {
     caption.textContent = node.kind === "custom" ? "CUSTOM CHIP" : node.kind === "dff" ? "RISING EDGE · CLK 1" :
       node.kind === "register" ? `${node.width}-BIT · LOAD · CLK ↑` :
       node.kind === "alu" ? `${node.width}-BIT · OP 00 + · 01 & · 10 OR · 11 XOR` :
-      node.kind === "ram" ? `${2 ** node.addressWidth} × ${node.width}-BIT · WE · CLK ↑` :
       node.kind === "decoder" ? `${2 ** node.addressWidth} OUTPUT BITS` : `${node.width}-BIT`;
     body.append(caption);
   }
@@ -1105,7 +1273,11 @@ function nodeLayout(node) {
   const ins = visibleInputDefs(node), outs = visibleOutputDefs(node);
   const wires = node.inputs.map((c, pin) => c && [c.sourceId, c.sourcePort,
     connectionProblem(node, pin, nodeById(c.sourceId), c.sourcePort, definitionById)]);
-  return { ins, outs, key: JSON.stringify([node.width, node.addressWidth, node.splitWidth, node.ledColumns, node.ledRows, node.ledMode, ins, outs, wires]) };
+  const ramLayout = node.kind === "ram"
+    ? [String(node.ramBase), String(node.ramEnd), String(ramPageStart(node))]
+    : [];
+  return { ins, outs, key: JSON.stringify([node.width, node.addressWidth, node.splitWidth, node.ledColumns,
+    node.ledRows, node.ledMode, ...ramLayout, ins, outs, wires]) };
 }
 function updateNodeBody(el, node, layout) {
   const old = el.querySelector(".node-body"), fresh = createNodeBody(node, layout);
@@ -1136,7 +1308,8 @@ function renderNodes() {
       if (previous.key !== layout.key) updateNodeBody(el, node, layout);
     }
     el.style.left = `${node.x}px`; el.style.top = `${node.y}px`;
-    el.style.width = node.kind === "display" ? `${Math.max(220, node.ledColumns * 18 + 76)}px` : "";
+    el.style.width = node.kind === "display" ? `${Math.max(220, node.ledColumns * 18 + 76)}px`
+      : node.kind === "ram" ? "390px" : "";
     nodeRenderState.set(el, { node, key: layout.key }); next.set(node.documentId, el);
   }
   for (const [id, el] of nodeElements) if (next.get(id) !== el) el.remove();

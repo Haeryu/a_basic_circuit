@@ -24,6 +24,7 @@ pub const Kind = enum(u8) {
     nor2 = 9,
     xnor2 = 10,
     counter = 11,
+    ram = 12,
 
     pub fn inputCount(self: Kind) usize {
         return switch (self) {
@@ -31,6 +32,9 @@ pub const Kind = enum(u8) {
             .output, .not, .buffer => 1,
             .and2, .or2, .xor2, .dff, .nand2, .nor2, .xnor2 => 2,
             .counter => 3,
+            // RAM is special-cased: address bits occupy pins 0..63, DATA is
+            // pin 64, WE pin 65 and CLK pin 66.
+            .ram => 67,
         };
     }
 };
@@ -61,9 +65,31 @@ const CounterGroup = struct {
     last_evaluated_round: u64 = 0,
 };
 
+const RamGroup = struct {
+    first: NodeId,
+    width: u8,
+    address_width: u8,
+    address: [64]NodeId = @splat(.invalid),
+    write_enable: NodeId = .invalid,
+    clock: NodeId = .invalid,
+    base: u64 = 0,
+    end: u64 = 0,
+    cells: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    previous_clock: bool = false,
+    cached_read: u64 = 0,
+    last_evaluated_round: u64 = 0,
+    alive: bool = true,
+};
+
+pub const RamCell = struct {
+    address: u64,
+    word: u64,
+};
+
 allocator: std.mem.Allocator,
 nodes: std.ArrayListUnmanaged(Node) = .empty,
 counter_groups: std.ArrayListUnmanaged(CounterGroup) = .empty,
+ram_groups: std.ArrayListUnmanaged(RamGroup) = .empty,
 
 // Rebuilt only when the graph changes. offsets/source -> consumers is CSR.
 fanout_offsets: std.ArrayListUnmanaged(u32) = .empty,
@@ -87,6 +113,8 @@ pub fn deinit(self: *Circuit) void {
     self.current.deinit(allocator);
     self.fanout.deinit(allocator);
     self.fanout_offsets.deinit(allocator);
+    for (self.ram_groups.items) |*group| group.cells.deinit(allocator);
+    self.ram_groups.deinit(allocator);
     self.counter_groups.deinit(allocator);
     self.nodes.deinit(allocator);
     self.* = undefined;
@@ -137,11 +165,122 @@ pub fn addCounter(self: *Circuit, width: usize) !NodeId {
     return first;
 }
 
+/// Add sparse native RAM. Address width may be 1..64 while the mapped window
+/// is configured separately; only non-zero cells occupy storage.
+pub fn addRam(self: *Circuit, width: usize, address_width: usize) !NodeId {
+    if (width == 0 or width > 64 or address_width == 0 or address_width > 64) return error.InvalidWidth;
+
+    const max_node_count: usize = std.math.maxInt(u32) - 1;
+    if (self.nodes.items.len > max_node_count - width) return error.CircuitTooLarge;
+    if (self.ram_groups.items.len >= max_node_count) return error.CircuitTooLarge;
+
+    try self.ram_groups.ensureUnusedCapacity(self.allocator, 1);
+    try self.nodes.ensureUnusedCapacity(self.allocator, width);
+
+    const first: NodeId = @enumFromInt(@as(u32, @intCast(self.nodes.items.len)));
+    const group_id: NodeId = @enumFromInt(@as(u32, @intCast(self.ram_groups.items.len)));
+    const default_end = if (address_width == 64)
+        std.math.maxInt(u64)
+    else
+        (@as(u64, 1) << @intCast(address_width)) - 1;
+    self.ram_groups.appendAssumeCapacity(.{
+        .first = first,
+        .width = @intCast(width),
+        .address_width = @intCast(address_width),
+        .end = default_end,
+    });
+
+    for (0..width) |_| self.nodes.appendAssumeCapacity(.{
+        .kind = .ram,
+        .inputs = .{ .invalid, group_id },
+    });
+
+    self.topology_dirty = true;
+    return first;
+}
+
+pub fn configureRam(self: *Circuit, id: NodeId, base: u64, end: u64) !void {
+    const lane = self.node(id) orelse return error.InvalidNode;
+    if (lane.kind != .ram) return error.NotRam;
+    const group_index = self.ramGroupIndex(lane) orelse return error.InvalidNode;
+    const group = &self.ram_groups.items[group_index];
+    if (base > end or !addressFits(group.address_width, end)) return error.ValueOutOfRange;
+
+    // Reconfiguring a mapped window keeps overlapping contents, but discarded
+    // addresses must not silently reappear if the window is expanded later.
+    var stale = std.ArrayListUnmanaged(u64).empty;
+    defer stale.deinit(self.allocator);
+    var iterator = group.cells.keyIterator();
+    while (iterator.next()) |address| {
+        if (address.* < base or address.* > end) try stale.append(self.allocator, address.*);
+    }
+    for (stale.items) |address| _ = group.cells.remove(address);
+
+    group.base = base;
+    group.end = end;
+    self.topology_dirty = true;
+}
+
+pub fn ramRead(self: *const Circuit, id: NodeId, address: u64) !u64 {
+    const lane = self.nodeConst(id) orelse return error.InvalidNode;
+    if (lane.kind != .ram) return error.NotRam;
+    const group_index = self.ramGroupIndex(lane) orelse return error.InvalidNode;
+    const group = &self.ram_groups.items[group_index];
+    if (address < group.base or address > group.end) return error.AddressOutOfRange;
+    return group.cells.get(address) orelse 0;
+}
+
+pub fn ramWrite(self: *Circuit, id: NodeId, address: u64, word: u64) !void {
+    const lane = self.node(id) orelse return error.InvalidNode;
+    if (lane.kind != .ram) return error.NotRam;
+    const group_index = self.ramGroupIndex(lane) orelse return error.InvalidNode;
+    const group = &self.ram_groups.items[group_index];
+    if (address < group.base or address > group.end) return error.AddressOutOfRange;
+    if (word & ~busMask(group.width) != 0) return error.ValueOutOfRange;
+    if (word == 0) _ = group.cells.remove(address) else try group.cells.put(self.allocator, address, word);
+    const current_address = self.ramAddress(group);
+    if (current_address == address) {
+        group.cached_read = word;
+        const first = group.first.index();
+        for (0..group.width) |bit| {
+            const output = word & (@as(u64, 1) << @intCast(bit)) != 0;
+            const output_lane = &self.nodes.items[first + bit];
+            if (output_lane.value == output or self.topology_dirty) continue;
+            output_lane.value = output;
+            self.scheduleConsumers(&self.current, ramLane(group.first, bit));
+        }
+    }
+}
+
+pub fn ramCellCount(self: *const Circuit, id: NodeId) !usize {
+    const lane = self.nodeConst(id) orelse return error.InvalidNode;
+    if (lane.kind != .ram) return error.NotRam;
+    const group_index = self.ramGroupIndex(lane) orelse return error.InvalidNode;
+    return self.ram_groups.items[group_index].cells.count();
+}
+
+pub fn appendRamCells(self: *const Circuit, id: NodeId, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(RamCell)) !void {
+    const lane = self.nodeConst(id) orelse return error.InvalidNode;
+    if (lane.kind != .ram) return error.NotRam;
+    const group_index = self.ramGroupIndex(lane) orelse return error.InvalidNode;
+    const group = &self.ram_groups.items[group_index];
+    try out.ensureUnusedCapacity(allocator, group.cells.count());
+    var iterator = group.cells.iterator();
+    while (iterator.next()) |entry| out.appendAssumeCapacity(.{
+        .address = entry.key_ptr.*,
+        .word = entry.value_ptr.*,
+    });
+}
+
 pub fn removeNode(self: *Circuit, id: NodeId) bool {
     const removed = self.node(id) orelse return false;
     if (removed.kind == .counter) {
         const group_index = self.counterGroupIndex(removed) orelse return false;
         return self.removeCounterGroup(group_index);
+    }
+    if (removed.kind == .ram) {
+        const group_index = self.ramGroupIndex(removed) orelse return false;
+        return self.removeRamGroup(group_index);
     }
 
     removed.alive = false;
@@ -162,6 +301,21 @@ pub fn removeNode(self: *Circuit, id: NodeId) bool {
 pub fn connect(self: *Circuit, source_id: NodeId, target_id: NodeId, pin: usize) !void {
     _ = self.node(source_id) orelse return error.InvalidNode;
     const target = self.node(target_id) orelse return error.InvalidNode;
+    if (target.kind == .ram) {
+        const group_index = self.ramGroupIndex(target) orelse return error.InvalidNode;
+        const group = &self.ram_groups.items[group_index];
+        if (pin < 64) {
+            if (pin >= group.address_width) return error.InvalidPin;
+            group.address[pin] = source_id;
+        } else switch (pin) {
+            64 => target.inputs[0] = source_id,
+            65 => group.write_enable = source_id,
+            66 => group.clock = source_id,
+            else => return error.InvalidPin,
+        }
+        self.topology_dirty = true;
+        return;
+    }
     if (pin >= target.kind.inputCount()) return error.InvalidPin;
     if (self.inputSource(target, pin) == source_id) return;
 
@@ -182,6 +336,23 @@ pub fn connect(self: *Circuit, source_id: NodeId, target_id: NodeId, pin: usize)
 
 pub fn disconnect(self: *Circuit, target_id: NodeId, pin: usize) bool {
     const target = self.node(target_id) orelse return false;
+    if (target.kind == .ram) {
+        const group_index = self.ramGroupIndex(target) orelse return false;
+        const group = &self.ram_groups.items[group_index];
+        const source = self.inputSource(target, pin);
+        if (source == .invalid) return false;
+        if (pin < 64) {
+            if (pin >= group.address_width) return false;
+            group.address[pin] = .invalid;
+        } else switch (pin) {
+            64 => target.inputs[0] = .invalid,
+            65 => group.write_enable = .invalid,
+            66 => group.clock = .invalid,
+            else => return false,
+        }
+        self.topology_dirty = true;
+        return true;
+    }
     if (pin >= target.kind.inputCount()) return false;
     if (self.inputSource(target, pin) == .invalid) return false;
 
@@ -241,6 +412,9 @@ pub fn state(self: *const Circuit, id: NodeId) !u2 {
     const previous_clock = if (n.kind == .counter) blk: {
         const group_index = self.counterGroupIndex(n) orelse return error.InvalidNode;
         break :blk self.counter_groups.items[group_index].previous_clock;
+    } else if (n.kind == .ram) blk: {
+        const group_index = self.ramGroupIndex(n) orelse return error.InvalidNode;
+        break :blk self.ram_groups.items[group_index].previous_clock;
     } else n.previous_clock;
     return @as(u2, @intFromBool(n.value)) | (@as(u2, @intFromBool(previous_clock)) << 1);
 }
@@ -259,6 +433,17 @@ pub fn restoreState(self: *Circuit, id: NodeId, saved: u2) !void {
             group.count |= bit;
         } else {
             group.count &= ~bit;
+        }
+        group.previous_clock = saved & 2 != 0;
+    } else if (n.kind == .ram) {
+        const group_index = self.ramGroupIndex(n) orelse return error.InvalidNode;
+        const group = &self.ram_groups.items[group_index];
+        const bit_index = id.index() - group.first.index();
+        const bit = @as(u64, 1) << @intCast(bit_index);
+        if (output) {
+            group.cached_read |= bit;
+        } else {
+            group.cached_read &= ~bit;
         }
         group.previous_clock = saved & 2 != 0;
     } else {
@@ -293,7 +478,7 @@ pub fn run(self: *Circuit, max_rounds: usize) !RunResult {
             if (!n.alive or n.kind == .input) continue;
 
             const old_value = n.value;
-            if (self.evaluate(idx) != old_value) {
+            if (try self.evaluate(idx) != old_value) {
                 work[changed_count] = id;
                 changed_count += 1;
             }
@@ -320,6 +505,7 @@ fn beginRound(self: *Circuit) void {
 
     // A serial wrap must not make a dormant group look evaluated this round.
     for (self.counter_groups.items) |*group| group.last_evaluated_round = 0;
+    for (self.ram_groups.items) |*group| group.last_evaluated_round = 0;
     self.round_serial = 1;
 }
 
@@ -396,9 +582,10 @@ fn rebuildIfNeeded(self: *Circuit) !void {
     self.topology_dirty = false;
 }
 
-fn evaluate(self: *Circuit, node_index: usize) bool {
+fn evaluate(self: *Circuit, node_index: usize) !bool {
     const n = &self.nodes.items[node_index];
     if (n.kind == .counter) return self.evaluateCounter(node_index);
+    if (n.kind == .ram) return self.evaluateRam(node_index);
 
     const a = self.readInput(n, 0);
     return switch (n.kind) {
@@ -418,8 +605,42 @@ fn evaluate(self: *Circuit, node_index: usize) bool {
             n.previous_clock = clock;
             break :blk if (rising) a else n.value;
         },
-        .counter => unreachable,
+        .counter, .ram => unreachable,
     };
+}
+
+fn evaluateRam(self: *Circuit, node_index: usize) !bool {
+    const n = &self.nodes.items[node_index];
+    const group_index = self.ramGroupIndex(n) orelse return n.value;
+    const group = &self.ram_groups.items[group_index];
+
+    if (group.last_evaluated_round != self.round_serial) {
+        group.last_evaluated_round = self.round_serial;
+        const address = self.ramAddress(group);
+        const clock = if (self.nodeConst(group.clock)) |source| source.value else false;
+        const rising = !group.previous_clock and clock;
+        group.previous_clock = clock;
+        const write_enable = if (self.nodeConst(group.write_enable)) |source| source.value else false;
+        if (rising and write_enable and
+            address >= group.base and address <= group.end)
+        {
+            var write_word: u64 = 0;
+            const first = group.first.index();
+            for (self.nodes.items[first..][0..group.width], 0..) |lane, bit| {
+                const source = self.nodeConst(lane.inputs[0]) orelse continue;
+                if (source.value) write_word |= @as(u64, 1) << @intCast(bit);
+            }
+            if (write_word == 0) {
+                _ = group.cells.remove(address);
+            } else {
+                try group.cells.put(self.allocator, address, write_word);
+            }
+        }
+        group.cached_read = if (address >= group.base and address <= group.end) group.cells.get(address) orelse 0 else 0;
+    }
+
+    const bit_index = node_index - group.first.index();
+    return group.cached_read & (@as(u64, 1) << @intCast(bit_index)) != 0;
 }
 
 fn evaluateCounter(self: *Circuit, node_index: usize) bool {
@@ -463,15 +684,28 @@ fn readInput(self: *const Circuit, n: *const Node, pin: usize) bool {
 }
 
 fn inputSource(self: *const Circuit, n: *const Node, pin: usize) NodeId {
-    if (n.kind != .counter) return n.inputs[pin];
-    const group_index = self.counterGroupIndex(n) orelse return .invalid;
-    const group = &self.counter_groups.items[group_index];
-    return switch (pin) {
-        0 => group.clock,
-        1 => group.load,
-        2 => n.inputs[0],
-        else => .invalid,
-    };
+    if (n.kind == .counter) {
+        const group_index = self.counterGroupIndex(n) orelse return .invalid;
+        const group = &self.counter_groups.items[group_index];
+        return switch (pin) {
+            0 => group.clock,
+            1 => group.load,
+            2 => n.inputs[0],
+            else => .invalid,
+        };
+    }
+    if (n.kind == .ram) {
+        const group_index = self.ramGroupIndex(n) orelse return .invalid;
+        const group = &self.ram_groups.items[group_index];
+        if (pin < 64) return if (pin < group.address_width) group.address[pin] else .invalid;
+        return switch (pin) {
+            64 => n.inputs[0],
+            65 => group.write_enable,
+            66 => group.clock,
+            else => .invalid,
+        };
+    }
+    return n.inputs[pin];
 }
 
 fn scheduleConsumers(self: *Circuit, queue: *std.ArrayListUnmanaged(NodeId), source_id: NodeId) void {
@@ -512,9 +746,43 @@ fn removeCounterGroup(self: *Circuit, group_index: usize) bool {
     return true;
 }
 
+fn removeRamGroup(self: *Circuit, group_index: usize) bool {
+    if (group_index >= self.ram_groups.items.len) return false;
+    const group = &self.ram_groups.items[group_index];
+    if (!group.alive) return false;
+
+    const first = group.first.index();
+    const end = first + @as(usize, group.width);
+    for (self.nodes.items[first..end]) |*lane| {
+        lane.alive = false;
+        lane.value = false;
+        lane.inputs = .{ .invalid, .invalid };
+        lane.previous_clock = false;
+    }
+    group.cells.deinit(self.allocator);
+    group.cells = .empty;
+    group.address = @splat(.invalid);
+    group.write_enable = .invalid;
+    group.clock = .invalid;
+    group.previous_clock = false;
+    group.cached_read = 0;
+    group.last_evaluated_round = 0;
+    group.alive = false;
+    self.clearDownstreamRange(first, end);
+    self.topology_dirty = true;
+    return true;
+}
+
 fn clearDownstreamRange(self: *Circuit, first: usize, end: usize) void {
     for (self.nodes.items) |*candidate| {
         if (!candidate.alive) continue;
+        if (candidate.kind == .ram) {
+            if (candidate.inputs[0] != .invalid) {
+                const source = candidate.inputs[0].index();
+                if (source >= first and source < end) candidate.inputs[0] = .invalid;
+            }
+            continue;
+        }
         // The second counter slot is metadata, never a signal reference.
         const count = if (candidate.kind == .counter) 1 else candidate.kind.inputCount();
         for (0..count) |pin| {
@@ -532,6 +800,19 @@ fn clearDownstreamRange(self: *Circuit, first: usize, end: usize) void {
             if (source >= first and source < end) source_id.* = .invalid;
         }
     }
+    for (self.ram_groups.items) |*group| {
+        if (!group.alive) continue;
+        for (group.address[0..group.address_width]) |*source_id| {
+            if (source_id.* == .invalid) continue;
+            const source = source_id.*.index();
+            if (source >= first and source < end) source_id.* = .invalid;
+        }
+        for ([_]*NodeId{ &group.write_enable, &group.clock }) |source_id| {
+            if (source_id.* == .invalid) continue;
+            const source = source_id.*.index();
+            if (source >= first and source < end) source_id.* = .invalid;
+        }
+    }
 }
 
 fn counterGroupIndex(self: *const Circuit, n: *const Node) ?usize {
@@ -542,9 +823,34 @@ fn counterGroupIndex(self: *const Circuit, n: *const Node) ?usize {
     return group_index;
 }
 
+fn ramGroupIndex(self: *const Circuit, n: *const Node) ?usize {
+    if (n.kind != .ram or n.inputs[1] == .invalid) return null;
+    const group_index = n.inputs[1].index();
+    if (group_index >= self.ram_groups.items.len) return null;
+    if (!self.ram_groups.items[group_index].alive) return null;
+    return group_index;
+}
+
 fn counterMask(width: u8) u64 {
     if (width == 64) return std.math.maxInt(u64);
     return (@as(u64, 1) << @intCast(width)) - 1;
+}
+
+fn busMask(width: u8) u64 {
+    return counterMask(width);
+}
+
+fn addressFits(width: u8, address: u64) bool {
+    return width == 64 or address < (@as(u64, 1) << @intCast(width));
+}
+
+fn ramAddress(self: *const Circuit, group: *const RamGroup) u64 {
+    var result: u64 = 0;
+    for (group.address[0..group.address_width], 0..) |source_id, bit| {
+        const source = self.nodeConst(source_id) orelse continue;
+        if (source.value) result |= @as(u64, 1) << @intCast(bit);
+    }
+    return result;
 }
 
 fn node(self: *Circuit, id: NodeId) ?*Node {
@@ -569,10 +875,21 @@ fn counterLane(first: NodeId, offset: usize) NodeId {
     return @enumFromInt(@intFromEnum(first) + @as(u32, @intCast(offset)));
 }
 
+fn ramLane(first: NodeId, offset: usize) NodeId {
+    return @enumFromInt(@intFromEnum(first) + @as(u32, @intCast(offset)));
+}
+
 fn expectCounterValue(circuit: *const Circuit, first: NodeId, width: usize, expected: u64) !void {
     for (0..width) |bit_index| {
         const bit = @as(u64, 1) << @intCast(bit_index);
         try std.testing.expectEqual(expected & bit != 0, try circuit.value(counterLane(first, bit_index)));
+    }
+}
+
+fn expectRamValue(circuit: *const Circuit, first: NodeId, width: usize, expected: u64) !void {
+    for (0..width) |bit_index| {
+        const bit = @as(u64, 1) << @intCast(bit_index);
+        try std.testing.expectEqual(expected & bit != 0, try circuit.value(ramLane(first, bit_index)));
     }
 }
 
@@ -1159,4 +1476,114 @@ test "counter load and increment reuse storage after topology preparation" {
         try expectCounterValue(&circuit, target, 64, pattern + 1);
     }
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "sparse sixty four bit RAM maps a high address window and writes only on rising edges" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+
+    const ram = try circuit.addRam(64, 64);
+    const base: u64 = 0x0020_0000_0000_0001;
+    const last = base + 3;
+    try circuit.configureRam(ram, base, last);
+    try circuit.ramWrite(ram, base, 0x8000_0001_0000_0001);
+    try circuit.ramWrite(ram, last, std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(usize, 2), try circuit.ramCellCount(ram));
+    try std.testing.expectEqual(@as(u64, 0x8000_0001_0000_0001), try circuit.ramRead(ram, base));
+    try std.testing.expectEqual(std.math.maxInt(u64), try circuit.ramRead(ram, last));
+    try std.testing.expectError(error.AddressOutOfRange, circuit.ramRead(ram, base - 1));
+    try std.testing.expectError(error.AddressOutOfRange, circuit.ramWrite(ram, last + 1, 1));
+
+    var address: [64]NodeId = undefined;
+    var data: [64]NodeId = undefined;
+    for (0..64) |bit| {
+        address[bit] = try circuit.addNode(.input);
+        data[bit] = try circuit.addNode(.input);
+        try circuit.connect(address[bit], ram, bit);
+        try circuit.connect(data[bit], ramLane(ram, bit), 64);
+    }
+    const write_enable = try circuit.addNode(.input);
+    const clock = try circuit.addNode(.input);
+    try circuit.connect(write_enable, ram, 65);
+    try circuit.connect(clock, ramLane(ram, 63), 66);
+
+    const setBus = struct {
+        fn apply(c: *Circuit, lanes: []const NodeId, word: u64) !void {
+            for (lanes, 0..) |lane, bit| try c.setInput(lane, word & (@as(u64, 1) << @intCast(bit)) != 0);
+        }
+    }.apply;
+
+    try setBus(&circuit, &address, base);
+    try expectSettled(&circuit);
+    try expectRamValue(&circuit, ram, 64, 0x8000_0001_0000_0001);
+    try setBus(&circuit, &address, last);
+    try expectSettled(&circuit);
+    try expectRamValue(&circuit, ram, 64, std.math.maxInt(u64));
+
+    const written: u64 = 0xfedc_ba98_7654_3210;
+    try setBus(&circuit, &address, base + 1);
+    try setBus(&circuit, &data, written);
+    try circuit.setInput(write_enable, true);
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try std.testing.expectEqual(written, try circuit.ramRead(ram, base + 1));
+    try expectRamValue(&circuit, ram, 64, written);
+
+    // DATA changes while CLK remains high must not create another write, even
+    // when an unrelated topology edit forces fanout reconstruction.
+    try setBus(&circuit, &data, 0x1234);
+    _ = try circuit.addNode(.output);
+    try expectSettled(&circuit);
+    try std.testing.expectEqual(written, try circuit.ramRead(ram, base + 1));
+
+    // An address outside the window reads zero and a rising WE edge is ignored.
+    try circuit.setInput(clock, false);
+    try setBus(&circuit, &address, base - 1);
+    try setBus(&circuit, &data, 0x55aa);
+    try expectSettled(&circuit);
+    try expectRamValue(&circuit, ram, 64, 0);
+    try circuit.setInput(clock, true);
+    try expectSettled(&circuit);
+    try std.testing.expectEqual(@as(usize, 3), try circuit.ramCellCount(ram));
+
+    try circuit.ramWrite(ram, base + 1, 0);
+    try std.testing.expectEqual(@as(usize, 2), try circuit.ramCellCount(ram));
+    try circuit.configureRam(ram, base + 1, last);
+    try std.testing.expectEqual(@as(usize, 1), try circuit.ramCellCount(ram));
+}
+
+test "RAM checkpoint retains held high clock history without a phantom write" {
+    var original = Circuit.init(std.testing.allocator);
+    defer original.deinit();
+    const ram = try original.addRam(8, 8);
+    const data = try original.addNode(.input);
+    const write_enable = try original.addNode(.input);
+    const clock = try original.addNode(.input);
+    for (0..8) |bit| try original.connect(data, ramLane(ram, bit), 64);
+    try original.connect(write_enable, ram, 65);
+    try original.connect(clock, ram, 66);
+    try original.setInput(data, true);
+    try original.setInput(write_enable, true);
+    try original.setInput(clock, true);
+    try expectSettled(&original);
+    try std.testing.expectEqual(@as(u64, 0xff), try original.ramRead(ram, 0));
+    const saved = try original.state(ram);
+    try std.testing.expect(saved & 2 != 0);
+
+    var restored = Circuit.init(std.testing.allocator);
+    defer restored.deinit();
+    const restored_ram = try restored.addRam(8, 8);
+    const restored_data = try restored.addNode(.input);
+    const restored_we = try restored.addNode(.input);
+    const restored_clock = try restored.addNode(.input);
+    for (0..8) |bit| try restored.connect(restored_data, ramLane(restored_ram, bit), 64);
+    try restored.connect(restored_we, restored_ram, 65);
+    try restored.connect(restored_clock, restored_ram, 66);
+    try restored.ramWrite(restored_ram, 0, 0x3c);
+    for (0..8) |bit| try restored.restoreState(ramLane(restored_ram, bit), saved & 2);
+    try restored.setInput(restored_data, true);
+    try restored.setInput(restored_we, true);
+    try restored.setInput(restored_clock, true);
+    try expectSettled(&restored);
+    try std.testing.expectEqual(@as(u64, 0x3c), try restored.ramRead(restored_ram, 0));
 }

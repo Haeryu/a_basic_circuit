@@ -12,6 +12,7 @@ var width_relations: std.ArrayListUnmanaged(Semantics.Relation) = .empty;
 var width_result: std.ArrayListUnmanaged(u8) = .empty;
 var definition_builder: ?CustomDefinition.Builder = null;
 var document_builder: ?DocumentCompiler.Builder = null;
+var ram_snapshot: std.ArrayListUnmanaged(Circuit.RamCell) = .empty;
 
 fn circuit() *Circuit {
     if (global_circuit == null) {
@@ -62,6 +63,7 @@ fn kind(raw: u32) ?Circuit.Kind {
 export fn abc_reset() void {
     if (global_circuit) |*value| value.deinit();
     global_circuit = null;
+    ram_snapshot.clearRetainingCapacity();
 }
 
 fn semanticKind(raw: u32) ?Semantics.Kind {
@@ -77,7 +79,8 @@ export fn abc_sem_input_count(kind_raw: u32, width: u32, address_width: u32, spl
     _ = width;
     _ = split_width;
     const k = semanticKind(kind_raw) orelse return invalid_id;
-    if (address_width == 0 or address_width > Semantics.max_address_width) return invalid_id;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (address_width == 0 or address_width > address_max) return invalid_id;
     return Semantics.inputCount(k, @intCast(address_width), rgb != 0);
 }
 
@@ -86,13 +89,15 @@ export fn abc_sem_output_count(kind_raw: u32, width: u32, address_width: u32, sp
     _ = split_width;
     _ = rgb;
     const k = semanticKind(kind_raw) orelse return invalid_id;
-    if (address_width == 0 or address_width > Semantics.max_address_width) return invalid_id;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (address_width == 0 or address_width > address_max) return invalid_id;
     return Semantics.outputCount(k, @intCast(address_width));
 }
 
 export fn abc_sem_input_width(kind_raw: u32, width: u32, address_width: u32, split_width: u32, rgb: u32, pin: u32) u32 {
     const k = semanticKind(kind_raw) orelse return 0;
-    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > Semantics.max_address_width) return 0;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > address_max) return 0;
     if ((k == .split or k == .join) and (split_width == 0 or split_width >= width)) return 0;
     return (Semantics.inputPort(k, @intCast(width), @intCast(address_width), @intCast(split_width), rgb != 0, pin) orelse return 0).width;
 }
@@ -100,14 +105,16 @@ export fn abc_sem_input_width(kind_raw: u32, width: u32, address_width: u32, spl
 export fn abc_sem_output_width(kind_raw: u32, width: u32, address_width: u32, split_width: u32, rgb: u32, pin: u32) u32 {
     _ = rgb;
     const k = semanticKind(kind_raw) orelse return 0;
-    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > Semantics.max_address_width) return 0;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > address_max) return 0;
     if ((k == .split or k == .join) and (split_width == 0 or split_width >= width)) return 0;
     return (Semantics.outputPort(k, @intCast(width), @intCast(address_width), @intCast(split_width), pin) orelse return 0).width;
 }
 
 export fn abc_sem_input_field(kind_raw: u32, width: u32, address_width: u32, split_width: u32, rgb: u32, pin: u32) u32 {
     const k = semanticKind(kind_raw) orelse return 0;
-    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > Semantics.max_address_width) return 0;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > address_max) return 0;
     if ((k == .split or k == .join) and (split_width == 0 or split_width >= width)) return 0;
     return @intFromEnum((Semantics.inputPort(k, @intCast(width), @intCast(address_width), @intCast(split_width), rgb != 0, pin) orelse return 0).field);
 }
@@ -115,7 +122,8 @@ export fn abc_sem_input_field(kind_raw: u32, width: u32, address_width: u32, spl
 export fn abc_sem_output_field(kind_raw: u32, width: u32, address_width: u32, split_width: u32, rgb: u32, pin: u32) u32 {
     _ = rgb;
     const k = semanticKind(kind_raw) orelse return 0;
-    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > Semantics.max_address_width) return 0;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > address_max) return 0;
     if ((k == .split or k == .join) and (split_width == 0 or split_width >= width)) return 0;
     return @intFromEnum((Semantics.outputPort(k, @intCast(width), @intCast(address_width), @intCast(split_width), pin) orelse return 0).field);
 }
@@ -181,7 +189,8 @@ export fn abc_def_reset() void {
 
 export fn abc_def_add_node(kind_raw: u32, width: u32, address_width: u32, split_width: u32) u32 {
     const k = semanticKind(kind_raw) orelse return invalid_id;
-    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > Semantics.max_address_width or split_width > Semantics.max_width) return invalid_id;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > address_max or split_width > Semantics.max_width) return invalid_id;
     return definitionBuilder().addNode(.{
         .kind = k,
         .width = @intCast(width),
@@ -295,7 +304,8 @@ export fn abc_doc_reset() void {
 
 export fn abc_doc_add_node(document_id: u32, kind_raw: u32, width: u32, address_width: u32, split_width: u32, rgb: u32) u32 {
     const k = DocumentCompiler.documentKind(kind_raw) orelse return invalid_id;
-    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > Semantics.max_address_width or split_width > Semantics.max_width) return invalid_id;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > address_max or split_width > Semantics.max_width) return invalid_id;
     return documentBuilder().addNode(.{
         .document_id = document_id,
         .kind = k,
@@ -317,7 +327,8 @@ export fn abc_doc_begin_custom(root_node: u32) u32 {
 
 export fn abc_doc_add_custom_child(custom: u32, local_id: u32, kind_raw: u32, width: u32, address_width: u32, split_width: u32) u32 {
     const k = semanticKind(kind_raw) orelse return invalid_id;
-    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > Semantics.max_address_width or split_width > Semantics.max_width) return invalid_id;
+    const address_max: u32 = if (k == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (width == 0 or width > Semantics.max_width or address_width == 0 or address_width > address_max or split_width > Semantics.max_width) return invalid_id;
     return documentBuilder().addCustomChild(custom, .{
         .local_id = local_id,
         .kind = k,
@@ -500,6 +511,78 @@ export fn abc_add_node(kind_raw: u32) u32 {
 export fn abc_add_counter(width: u32) u32 {
     const id = circuit().addCounter(@intCast(width)) catch return invalid_id;
     return @intFromEnum(id);
+}
+
+fn joinU64(low: u32, high: u32) u64 {
+    return @as(u64, low) | (@as(u64, high) << 32);
+}
+
+/// Configure the mapped address window of a native RAM group.
+/// Status: 0 ok, 1 invalid/not RAM, 2 invalid range, 3 allocation failure.
+export fn abc_ram_configure(id: u32, base_low: u32, base_high: u32, end_low: u32, end_high: u32) u32 {
+    circuit().configureRam(nodeId(id), joinU64(base_low, base_high), joinU64(end_low, end_high)) catch |err| {
+        return switch (err) {
+            error.InvalidNode, error.NotRam => 1,
+            error.ValueOutOfRange => 2,
+            error.OutOfMemory => 3,
+        };
+    };
+    return 0;
+}
+
+/// Read one mapped RAM word. Invalid/out-of-range reads return zero; the
+/// simulator itself also drives zero whenever ADDR is outside the mapped window.
+export fn abc_ram_read_low(id: u32, address_low: u32, address_high: u32) u32 {
+    const word = circuit().ramRead(nodeId(id), joinU64(address_low, address_high)) catch return 0;
+    return @truncate(word);
+}
+
+export fn abc_ram_read_high(id: u32, address_low: u32, address_high: u32) u32 {
+    const word = circuit().ramRead(nodeId(id), joinU64(address_low, address_high)) catch return 0;
+    return @truncate(word >> 32);
+}
+
+/// Write one mapped RAM word directly (editor/load path, not a simulated CLK).
+/// Status: 0 ok, 1 invalid/not RAM, 2 address outside mapping, 3 value too wide,
+/// 4 allocation failure.
+export fn abc_ram_write(id: u32, address_low: u32, address_high: u32, word_low: u32, word_high: u32) u32 {
+    circuit().ramWrite(nodeId(id), joinU64(address_low, address_high), joinU64(word_low, word_high)) catch |err| {
+        return switch (err) {
+            error.InvalidNode, error.NotRam => 1,
+            error.AddressOutOfRange => 2,
+            error.ValueOutOfRange => 3,
+            error.OutOfMemory => 4,
+        };
+    };
+    return 0;
+}
+
+/// Snapshot all allocated (non-zero) sparse cells in one pass. The following
+/// snapshot accessors remain valid until the next snapshot/reset call.
+export fn abc_ram_snapshot(id: u32) u32 {
+    ram_snapshot.clearRetainingCapacity();
+    circuit().appendRamCells(nodeId(id), std.heap.wasm_allocator, &ram_snapshot) catch return invalid_id;
+    return std.math.cast(u32, ram_snapshot.items.len) orelse invalid_id;
+}
+
+export fn abc_ram_snapshot_address_low(index: u32) u32 {
+    if (index >= ram_snapshot.items.len) return 0;
+    return @truncate(ram_snapshot.items[index].address);
+}
+
+export fn abc_ram_snapshot_address_high(index: u32) u32 {
+    if (index >= ram_snapshot.items.len) return 0;
+    return @truncate(ram_snapshot.items[index].address >> 32);
+}
+
+export fn abc_ram_snapshot_word_low(index: u32) u32 {
+    if (index >= ram_snapshot.items.len) return 0;
+    return @truncate(ram_snapshot.items[index].word);
+}
+
+export fn abc_ram_snapshot_word_high(index: u32) u32 {
+    if (index >= ram_snapshot.items.len) return 0;
+    return @truncate(ram_snapshot.items[index].word >> 32);
 }
 
 export fn abc_remove_node(id: u32) u32 {

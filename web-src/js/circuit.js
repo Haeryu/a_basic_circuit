@@ -1,6 +1,7 @@
 // Zig owns circuit semantics and lowering; this module projects them into DOM-friendly objects.
 export const MAX_WIDTH = 64;
 export const MAX_ADDRESS_WIDTH = 6;
+export const MAX_RAM_ADDRESS_WIDTH = 64;
 const SEMANTIC_KIND = Object.freeze({ input: 0, output: 1, not: 2, and2: 3, or2: 4,
   xor2: 5, dff: 6, buffer: 7, nand2: 8, nor2: 9, xnor2: 10, oscillator: 11,
   clock: 12, mux: 13, demux: 14, decoder: 15, adder: 16, split: 17, join: 18, display: 19,
@@ -76,6 +77,57 @@ export function parseInputValue(text, width) {
   return { value, radix };
 }
 
+export function ramAddressLimit(width) {
+  if (!validWidth(width, 1, MAX_RAM_ADDRESS_WIDTH)) throw new Error("RAM address width must be an integer from 1 to 64");
+  return (1n << BigInt(width)) - 1n;
+}
+
+export function cloneRamCells(value) {
+  if (value == null) return new Map();
+  if (value instanceof Map) return new Map(value);
+  if (Array.isArray(value)) return new Map(value.map(([address, word]) => [BigInt(address), BigInt(word)]));
+  throw new TypeError("RAM cells must be a Map or entry array");
+}
+
+function ramConfig(node) {
+  const addressWidth = node.addressWidth ?? 1;
+  if (!validWidth(addressWidth, 1, MAX_RAM_ADDRESS_WIDTH)) throw new Error("RAM address width must be 1–64 bits");
+  const limit = ramAddressLimit(addressWidth);
+  const base = node.ramBase ?? 0n;
+  const end = node.ramEnd ?? limit;
+  if (typeof base !== "bigint" || typeof end !== "bigint" || base < 0n || end < base || end > limit) {
+    throw new Error(`RAM mapped range must fit its ${addressWidth}-bit address bus`);
+  }
+  const cells = cloneRamCells(node.ramCells);
+  const wordLimit = maskValue(-1n, node.width);
+  for (const [address, word] of cells) {
+    if (typeof address !== "bigint" || typeof word !== "bigint" || address < base || address > end ||
+        word < 0n || word > wordLimit) throw new Error("RAM image contains an out-of-range address or value");
+    if (word === 0n) cells.delete(address);
+  }
+  return { addressWidth, base, end, cells };
+}
+
+export function setRamRange(node, base, end) {
+  base = BigInt(base); end = BigInt(end);
+  const limit = ramAddressLimit(node.addressWidth ?? 1);
+  if (base < 0n || end < base || end > limit) throw new Error(`RAM mapped range must fit its ${node.addressWidth}-bit address bus`);
+  node.ramBase = base; node.ramEnd = end;
+  const cells = cloneRamCells(node.ramCells);
+  for (const address of cells.keys()) if (address < base || address > end) cells.delete(address);
+  node.ramCells = cells;
+}
+
+export function setRamImageCell(node, address, value) {
+  address = BigInt(address); value = BigInt(value);
+  const { base, end } = ramConfig(node);
+  if (address < base || address > end) throw new Error("RAM cell address is outside the mapped range");
+  value = maskValue(value, node.width);
+  const cells = cloneRamCells(node.ramCells);
+  if (value === 0n) cells.delete(address); else cells.set(address, value);
+  node.ramCells = cells;
+}
+
 export function formatBusValue(value, width, radix = 16) {
   const prefix = radix === 16 ? "0x" : radix === 2 ? "0b" : radix === 8 ? "0o" : "";
   const digits = radix === 10 ? 1 : Math.ceil(width / Math.log2(radix));
@@ -98,6 +150,7 @@ export function makeNode(documentId, kind, x, y, width = 1, definitionId = null)
   if (kind === "oscillator") Object.assign(node, { clockHz: 1, clockRunning: false });
   if (kind === "input" || kind === "clock") node.inputRadix = 16;
   if (kind === "display") Object.assign(node, defaultDisplayLayout(width), { ledMode: "mono", ledColor: "#ffd36f" });
+  if (kind === "ram") Object.assign(node, { ramBase: 0n, ramEnd: ramAddressLimit(node.addressWidth), ramCells: new Map() });
   return node;
 }
 
@@ -202,6 +255,7 @@ export function ensureInputSlots(node, lookup) {
 
 function cloneDefinitionCandidate(node) {
   return { ...node, widthParameters: { ...(node.widthParameters ?? {}) },
+    ...(node.kind === "ram" ? { ramCells: cloneRamCells(node.ramCells) } : {}),
     inputs: (node.inputs ?? []).map((connection) => connection && { ...connection }) };
 }
 
@@ -345,6 +399,9 @@ export function createDefinition(selected, name, id, lookup = () => null) {
     width: n.width, addressWidth: n.addressWidth, splitWidth: n.splitWidth, inputValue: 0n,
     x: n.x, y: n.y, label: n.label, definitionId: n.kind === "custom" ? n.definitionId : null,
     widthParameters: n.kind === "custom" ? { ...(n.widthParameters ?? {}) } : {},
+    ...(n.kind === "ram" ? (() => { const config = ramConfig(n); return {
+      ramBase: config.base, ramEnd: config.end, ramCells: config.cells,
+    }; })() : {}),
     inputs: n.inputs.map((c) => {
       if (!c) return null;
       if (!selectedIds.has(c.sourceId)) throw new Error("Chip input comes from outside the selection");
@@ -477,6 +534,26 @@ export function resolveCustom(node, lookup) {
       const group = definition.bindings[`${spec.localId}:${field}`];
       if (group != null) result[field] = widths[group];
     }
+    if (result.kind === "ram") {
+      const originalLimit = ramAddressLimit(spec.addressWidth);
+      if ((spec.ramBase ?? 0n) === 0n && (spec.ramEnd ?? originalLimit) === originalLimit) {
+        result.ramBase = 0n;
+        result.ramEnd = ramAddressLimit(result.addressWidth);
+      } else {
+        const limit = ramAddressLimit(result.addressWidth);
+        result.ramBase = spec.ramBase ?? 0n;
+        result.ramEnd = spec.ramEnd ?? originalLimit;
+        if (result.ramBase < 0n || result.ramEnd < result.ramBase || result.ramEnd > limit) {
+          throw new Error("RAM mapped range does not fit the resolved address width");
+        }
+      }
+      result.ramCells = new Map();
+      for (const [address, word] of cloneRamCells(spec.ramCells)) {
+        if (address < result.ramBase || address > result.ramEnd) continue;
+        const masked = maskValue(word, result.width);
+        if (masked !== 0n) result.ramCells.set(address, masked);
+      }
+    }
     return result;
   });
   const result = { definition, widths, parameters: node.widthParameters, nodes: resolved,
@@ -517,6 +594,63 @@ export function setRuntimeCounter(wasm, handle, value) {
   if (wasm.abc_set_counter(handle.outputs[0][0], Number(value & 0xffffffffn), Number(value >> 32n)) !== 0) {
     throw new Error("Could not set counter value");
   }
+}
+
+function lowU32(value) { return Number(BigInt(value) & 0xffffffffn); }
+function highU32(value) { return Number((BigInt(value) >> 32n) & 0xffffffffn); }
+function fromU32Pair(low, high) { return BigInt(low >>> 0) | (BigInt(high >>> 0) << 32n); }
+
+function ramRuntimeNode(handle) {
+  const id = handle?.outputs?.[0]?.[0];
+  if (!Number.isInteger(id)) throw new Error("RAM runtime handle is unavailable");
+  return id;
+}
+
+function ramDescriptorSignature(node) {
+  const { base, end, cells } = ramConfig(node);
+  const entries = [...cells].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return `${node.width}/${node.addressWidth}/${base}/${end}/` + entries.map(([address, word]) => `${address}:${word}`).join(",");
+}
+
+function snapshotRamHandle(wasm, handle) {
+  const count = wasm.abc_ram_snapshot(ramRuntimeNode(handle)) >>> 0;
+  if (count === INVALID_ID) throw new Error("Could not snapshot RAM state");
+  const cells = new Map();
+  for (let index = 0; index < count; index += 1) {
+    const address = fromU32Pair(wasm.abc_ram_snapshot_address_low(index), wasm.abc_ram_snapshot_address_high(index));
+    const word = fromU32Pair(wasm.abc_ram_snapshot_word_low(index), wasm.abc_ram_snapshot_word_high(index));
+    if (word !== 0n) cells.set(address, word);
+  }
+  return cells;
+}
+
+export function snapshotRuntimeRamStates(wasm, runtime) {
+  const result = new Map();
+  if (!runtime?.rams) return result;
+  for (const [key, entry] of runtime.rams) result.set(key, snapshotRamHandle(wasm, entry.handle));
+  return result;
+}
+
+export function readRuntimeRamCell(wasm, handle, address) {
+  address = BigInt(address);
+  return fromU32Pair(
+    wasm.abc_ram_read_low(ramRuntimeNode(handle), lowU32(address), highU32(address)),
+    wasm.abc_ram_read_high(ramRuntimeNode(handle), lowU32(address), highU32(address)),
+  );
+}
+
+export function setRuntimeRamCell(wasm, handle, node, address, value) {
+  address = BigInt(address); value = BigInt(value);
+  const { base, end } = ramConfig(node);
+  if (address < base || address > end) throw new Error("RAM cell address is outside the mapped range");
+  if (value < 0n || value > maskValue(-1n, node.width)) throw new Error(`Value does not fit ${node.width} bits`);
+  const status = wasm.abc_ram_write(ramRuntimeNode(handle), lowU32(address), highU32(address), lowU32(value), highU32(value)) >>> 0;
+  if (status === 2) throw new Error("RAM cell address is outside the mapped range");
+  if (status === 3) throw new Error(`Value does not fit ${node.width} bits`);
+  if (status === 4) throw new Error("Could not allocate RAM cell storage");
+  if (status !== 0) throw new Error("Could not write RAM cell");
+  setRamImageCell(node, address, value);
+  if (handle.ram) handle.ram.signature = ramDescriptorSignature(node);
 }
 
 const INVALID_ID = 0xffffffff;
@@ -612,6 +746,19 @@ function flattenCustomInstance(instance, lookup) {
   // save/open or clipboard paste is free to remap definition ids.
   const tree = expand(instance, [], true, new Set());
   return { flatNodes, flatById, tree };
+}
+
+function ramSpecsForDocument(nodes, customInfo) {
+  const result = new Map();
+  nodes.forEach((node, rootIndex) => {
+    if (node.kind === "ram") result.set(`${node.documentId}/ram`, node);
+    const custom = customInfo.get(rootIndex);
+    if (!custom) return;
+    for (const child of custom.expansion.flatNodes) {
+      if (child.kind === "ram") result.set(`${node.documentId}/${child.localId}/ram`, child);
+    }
+  });
+  return result;
 }
 
 function documentStatus(status) {
@@ -737,21 +884,24 @@ function readDocumentHandle(wasm, handleId, probe = true) {
 
 export function analyzeCircuit(nodes, definitions) {
   const wasm = semantics();
-  submitDocument(wasm, nodes, definitions);
+  const { customInfo } = submitDocument(wasm, nodes, definitions);
   documentStatus(wasm.abc_doc_analyze() >>> 0);
   const stateKeys = new Map();
   for (let index = 0; index < (wasm.abc_doc_state_count() >>> 0); index += 1) {
     stateKeys.set(stateRecord(wasm, index, nodes).key, null);
   }
-  return { stateKeys, diagnostics: documentDiagnostics(wasm, nodes), scalarNodes: wasm.abc_doc_scalar_count() >>> 0 };
+  return { stateKeys, ramSpecs: ramSpecsForDocument(nodes, customInfo),
+    diagnostics: documentDiagnostics(wasm, nodes), scalarNodes: wasm.abc_doc_scalar_count() >>> 0 };
 }
 
-export function compileCircuit(wasm, nodes, definitions, previous = null, stateStore = null) {
+export function compileCircuit(wasm, nodes, definitions, previous = null, stateStore = null, ramStateStore = null) {
   const snapshots = stateStore ?? new Map();
   if (previous) for (const [key, id] of previous.stateKeys) {
     const state = wasm.abc_state(id);
     if (state <= 3) snapshots.set(key, state);
   }
+  const previousRamStates = previous ? snapshotRuntimeRamStates(wasm, previous) : new Map();
+  if (ramStateStore && previous) for (const [key, cells] of previousRamStates) ramStateStore.set(key, cells);
   const { customInfo } = submitDocument(wasm, nodes, definitions);
   documentStatus(wasm.abc_doc_compile() >>> 0);
   const stateKeys = new Map();
@@ -764,6 +914,7 @@ export function compileCircuit(wasm, nodes, definitions, previous = null, stateS
     }
   }
   const handles = new Map();
+  const ramHandles = new Map();
   nodes.forEach((node, index) => {
     const top = readDocumentHandle(wasm, wasm.abc_doc_top_handle(index) >>> 0,
       node.kind !== "custom" && node.kind !== "display");
@@ -771,6 +922,9 @@ export function compileCircuit(wasm, nodes, definitions, previous = null, stateS
     if (custom) {
       const flatHandles = custom.expansion.flatNodes.map((_, childIndex) =>
         readDocumentHandle(wasm, wasm.abc_doc_custom_child_handle(custom.custom, childIndex) >>> 0));
+      custom.expansion.flatNodes.forEach((child, childIndex) => {
+        if (child.kind === "ram") ramHandles.set(`${node.documentId}/${child.localId}/ram`, flatHandles[childIndex]);
+      });
       const aliasTree = (tree) => {
         const children = new Map();
         for (const [localId, entry] of tree.entries) {
@@ -783,11 +937,42 @@ export function compileCircuit(wasm, nodes, definitions, previous = null, stateS
       };
       top.children = aliasTree(custom.expansion.tree).children;
     }
+    if (node.kind === "ram") ramHandles.set(`${node.documentId}/ram`, top);
     handles.set(node.documentId, top);
   });
+
+  const ramSpecs = ramSpecsForDocument(nodes, customInfo);
+  const rams = new Map();
+  for (const [key, spec] of ramSpecs) {
+    const handle = ramHandles.get(key);
+    if (!handle) throw new Error("WASM returned an invalid RAM handle");
+    const config = ramConfig(spec);
+    const status = wasm.abc_ram_configure(ramRuntimeNode(handle), lowU32(config.base), highU32(config.base),
+      lowU32(config.end), highU32(config.end)) >>> 0;
+    if (status === 2) throw new Error("RAM mapped range is invalid");
+    if (status === 3) throw new Error("Could not allocate RAM mapping storage");
+    if (status !== 0) throw new Error("Could not configure RAM mapping");
+    const signature = ramDescriptorSignature(spec);
+    const previousEntry = previous?.rams?.get(key);
+    const sourceCells = previousEntry
+      ? previousEntry.signature === signature ? previousRamStates.get(key) ?? new Map() : config.cells
+      : ramStateStore?.get(key) ?? config.cells;
+    for (const [address, rawWord] of sourceCells) {
+      if (address < config.base || address > config.end) continue;
+      const word = maskValue(rawWord, spec.width);
+      if (word === 0n) continue;
+      const writeStatus = wasm.abc_ram_write(ramRuntimeNode(handle), lowU32(address), highU32(address),
+        lowU32(word), highU32(word)) >>> 0;
+      if (writeStatus === 4) throw new Error("Could not allocate RAM cell storage");
+      if (writeStatus !== 0) throw new Error("Could not restore RAM cell state");
+    }
+    const entry = { key, handle, signature };
+    handle.ram = entry;
+    rams.set(key, entry);
+  }
   for (const node of nodes) if (node.kind === "input" || node.kind === "oscillator") {
     setRuntimeInput(wasm, handles.get(node.documentId), maskValue(node.inputValue, node.width));
   }
-  return { handles, diagnostics: documentDiagnostics(wasm, nodes), stateKeys,
+  return { handles, rams, diagnostics: documentDiagnostics(wasm, nodes), stateKeys,
     scalarNodes: wasm.abc_doc_scalar_count() >>> 0 };
 }

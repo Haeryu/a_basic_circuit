@@ -143,7 +143,7 @@ pub const Builder = struct {
                     &variables,
                     node.address_width,
                     1,
-                    Semantics.max_address_width,
+                    if (node.kind == .ram) Semantics.max_ram_address_width else Semantics.max_address_width,
                 );
             }
             if (node.kind == .split or node.kind == .join) {

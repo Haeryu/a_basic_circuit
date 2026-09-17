@@ -1,10 +1,11 @@
-import { analyzeCircuit } from "./circuit.js";
+import { analyzeCircuit, cloneRamCells, ramAddressLimit } from "./circuit.js";
 import { decodeDocumentPayload, encodeDocumentPayload } from "./clipboard.js";
 
 const FORMAT = "a_basic_circuit/project";
 const VERSION = 1;
 const MAX_TEXT_LENGTH = 32 * 1024 * 1024;
 const MAX_STATE_ENTRIES = 250_000;
+const MAX_RAM_STATE_CELLS = 250_000;
 
 function projectError(message) {
   const error = new Error(`Invalid circuit project data: ${message}`);
@@ -126,6 +127,91 @@ function decodedStates(value, expectedStateKeys, nodes) {
   return result;
 }
 
+function decimalBigInt(value, context, maximum) {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]{0,19})$/.test(value)) {
+    invalid(`${context} must be an unsigned decimal string`);
+  }
+  const result = BigInt(value);
+  if (result > maximum) invalid(`${context} is out of range`);
+  return result;
+}
+
+function ramSpecRange(spec) {
+  const limit = ramAddressLimit(spec.addressWidth);
+  return {
+    base: spec.ramBase ?? 0n,
+    end: spec.ramEnd ?? limit,
+    wordLimit: (1n << BigInt(spec.width)) - 1n,
+  };
+}
+
+function encodedRamStates(ramStates, ramSpecs, nodes) {
+  if (!(ramStates instanceof Map)) invalid("options.ramStates must be a Map");
+  if (ramStates.size > ramSpecs.size) invalid("options.ramStates contains too many RAM instances");
+  const documentIndex = new Map(nodes.map((node, index) => [node.documentId, index]));
+  let totalCells = 0;
+  const result = [];
+  for (const [key, rawCells] of ramStates) {
+    if (typeof key !== "string" || !ramSpecs.has(key)) {
+      invalid(`options.ramStates contains an unknown RAM state key: ${key}`);
+    }
+    let cells;
+    try { cells = cloneRamCells(rawCells); }
+    catch { invalid(`options.ramStates[${key}] must be a RAM cell Map`); }
+    const spec = ramSpecs.get(key);
+    const { base, end, wordLimit } = ramSpecRange(spec);
+    totalCells += cells.size;
+    if (totalCells > MAX_RAM_STATE_CELLS) invalid(`options.ramStates must contain at most ${MAX_RAM_STATE_CELLS} cells`);
+    const encodedCells = [];
+    for (const [address, word] of cells) {
+      if (typeof address !== "bigint" || typeof word !== "bigint" || address < base || address > end) {
+        invalid(`options.ramStates[${key}] contains an address outside the mapped range`);
+      }
+      if (word < 0n || word > wordLimit) invalid(`options.ramStates[${key}] contains a value wider than ${spec.width} bits`);
+      if (word !== 0n) encodedCells.push([address.toString(10), word.toString(10)]);
+    }
+    encodedCells.sort((a, b) => {
+      const left = BigInt(a[0]), right = BigInt(b[0]);
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
+    result.push([originalStateKey(key, documentIndex, `options.ramStates[${key}]`), encodedCells]);
+  }
+  result.sort(([a], [b]) => a.localeCompare(b));
+  return result;
+}
+
+function decodedRamStates(value, ramSpecs, nodes) {
+  if (value === undefined) return new Map();
+  if (!Array.isArray(value) || value.length > ramSpecs.size) invalid("root.ramStates contains too many RAM instances");
+  const result = new Map();
+  let totalCells = 0;
+  for (const [index, entry] of value.entries()) {
+    const context = `root.ramStates[${index}]`;
+    if (!Array.isArray(entry) || entry.length !== 2) invalid(`${context} must be a [key, cells] pair`);
+    const key = restoredStateKey(entry[0], nodes, `${context}[0]`);
+    const spec = ramSpecs.get(key);
+    if (!spec) invalid(`${context}[0] is not a live RAM state key`);
+    if (result.has(key)) invalid(`${context}[0] duplicates a remapped RAM state key`);
+    if (!Array.isArray(entry[1])) invalid(`${context}[1] must be an array`);
+    totalCells += entry[1].length;
+    if (totalCells > MAX_RAM_STATE_CELLS) invalid(`root.ramStates must contain at most ${MAX_RAM_STATE_CELLS} cells`);
+    const { base, end, wordLimit } = ramSpecRange(spec);
+    const limit = ramAddressLimit(spec.addressWidth);
+    const cells = new Map();
+    for (const [cellIndex, pair] of entry[1].entries()) {
+      const cellContext = `${context}[1][${cellIndex}]`;
+      if (!Array.isArray(pair) || pair.length !== 2) invalid(`${cellContext} must be an [address, value] pair`);
+      const address = decimalBigInt(pair[0], `${cellContext}[0]`, limit);
+      if (address < base || address > end) invalid(`${cellContext}[0] is outside the mapped range`);
+      if (cells.has(address)) invalid(`${cellContext}[0] duplicates a RAM address`);
+      const word = decimalBigInt(pair[1], `${cellContext}[1]`, wordLimit);
+      if (word !== 0n) cells.set(address, word);
+    }
+    result.set(key, cells);
+  }
+  return result;
+}
+
 function encodedOscillatorLevels(nodes) {
   const levels = [];
   for (const [index, node] of nodes.entries()) {
@@ -178,6 +264,7 @@ export function serializeProject(nodes, definitions, options = {}) {
   record(options, "options");
   const view = normalizedView(options.view);
   const states = options.states === undefined ? new Map() : options.states;
+  const ramStates = options.ramStates === undefined ? new Map() : options.ramStates;
   const document = shared(() => encodeDocumentPayload(nodes, definitions));
   const oscillatorLevels = encodedOscillatorLevels(nodes);
   const runtime = validationRuntime(nodes, definitions);
@@ -189,6 +276,7 @@ export function serializeProject(nodes, definitions, options = {}) {
     nodes: document.nodes,
     oscillatorLevels,
     states: encodedStates(states, runtime.stateKeys, nodes),
+    ramStates: encodedRamStates(ramStates, runtime.ramSpecs, nodes),
   };
   const result = JSON.stringify(payload);
   if (result.length > MAX_TEXT_LENGTH) invalid("project is too large to save");
@@ -205,6 +293,7 @@ export function deserializeProject(textValue, options) {
   restoreOscillatorLevels(root.oscillatorLevels === undefined ? [] : root.oscillatorLevels, decoded.nodes);
   const runtime = validationRuntime(decoded.nodes, decoded.definitions);
   const states = decodedStates(root.states, runtime.stateKeys, decoded.nodes);
+  const ramStates = decodedRamStates(root.ramStates, runtime.ramSpecs, decoded.nodes);
   return {
     nodes: decoded.nodes,
     definitions: decoded.definitions,
@@ -212,5 +301,6 @@ export function deserializeProject(textValue, options) {
     nextDefinitionId: decoded.nextDefinitionId,
     view,
     states,
+    ramStates,
   };
 }

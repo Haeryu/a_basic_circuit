@@ -291,6 +291,46 @@ test("projects preserve counter load wiring and native history while clipboard p
   ]);
 });
 
+test("projects preserve mapped RAM image and live sparse state above 2^53", () => {
+  const base = 0x0020000000000001n, end = base + 0xffn;
+  const ram = node(42, "ram", 100, 100, 64, {
+    addressWidth: 64,
+    ramBase: base,
+    ramEnd: end,
+    ramCells: new Map([[base, 0x1111222233334444n]]),
+  });
+  const liveCells = new Map([
+    [base, 0xaaaaaaaaaaaaaaaan],
+    [base + 0x80n, 0x8000000100000001n],
+    [end, 0xffffffffffffffffn],
+  ]);
+  const text = serializeProject([ram], [], { ramStates: new Map([["42/ram", liveCells]]) });
+  const encoded = JSON.parse(text);
+  assert.equal(encoded.nodes[0].ramBase, base.toString(10));
+  assert.equal(encoded.nodes[0].ramEnd, end.toString(10));
+  assert.deepEqual(encoded.nodes[0].ramCells, [[base.toString(10), "1229801703532086340"]]);
+  assert.deepEqual(encoded.ramStates, [["0/ram", [
+    [base.toString(10), "12297829382473034410"],
+    [(base + 0x80n).toString(10), "9223372041149743105"],
+    [end.toString(10), "18446744073709551615"],
+  ]]]);
+
+  const loaded = deserializeProject(text, { nextDocumentId: 100, nextDefinitionId: 1 });
+  assert.equal(loaded.nodes[0].documentId, 100);
+  assert.equal(loaded.nodes[0].addressWidth, 64);
+  assert.equal(loaded.nodes[0].ramBase, base);
+  assert.equal(loaded.nodes[0].ramEnd, end);
+  assert.equal(loaded.nodes[0].ramCells.get(base), 0x1111222233334444n);
+  assert.deepEqual([...loaded.ramStates.get("100/ram")], [...liveCells]);
+
+  const legacy = JSON.parse(text);
+  delete legacy.ramStates;
+  const legacyLoaded = deserializeProject(JSON.stringify(legacy), { nextDocumentId: 200, nextDefinitionId: 1 });
+  assert.equal(legacyLoaded.ramStates.size, 0);
+  assert.equal(legacyLoaded.nodes[0].ramCells.get(base), 0x1111222233334444n,
+    "legacy projects without runtime RAM snapshots still retain the document image");
+});
+
 test("legacy projects normalize empty and CLK-only clock inputs in documents and custom definitions", () => {
   const edge = node(1, "input", 0, 0, 1);
   const connected = node(2, "clock", 200, 0, 4, { inputRadix: 8 });

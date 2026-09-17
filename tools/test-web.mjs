@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { makeNode, inputDefs, outputDefs, ensureInputSlots, validWidth, maskValue, bitValue,
   busValue, createDefinition, inferDefinitionSelection, resolveCustom, changeCustomWidth, compileCircuit, readBus, setRuntimeInput,
-  setRuntimeCounter, setSemanticWasm } from "../web-src/js/circuit.js";
+  setRuntimeCounter, ramAddressLimit, readRuntimeRamCell, setRuntimeRamCell, snapshotRuntimeRamStates,
+  setSemanticWasm } from "../web-src/js/circuit.js";
 
 const { instance } = await WebAssembly.instantiate(await readFile(new URL("../zig-out/web/wasm/a_basic_circuit.wasm", import.meta.url)), {});
 const wasm = instance.exports;
@@ -15,6 +16,9 @@ function fixture() {
   const lookup = (id) => definitions.find((d) => d.id === id);
   const add = (kind, width = 1, extra = {}) => {
     const node = Object.assign(makeNode(nodes.length + 1, kind, 0, 0, width), extra);
+    if (kind === "ram" && extra.addressWidth != null && extra.ramEnd == null) {
+      node.ramBase = 0n; node.ramEnd = ramAddressLimit(node.addressWidth);
+    }
     ensureInputSlots(node, lookup); nodes.push(node); return node;
   };
   const link = (source, target, pin = 0, sourcePort = 0) => {
@@ -124,6 +128,51 @@ test("RAM writes selected words on rising WE clock and reads addresses asynchron
   assert.equal(f.value(ram), 0xa5n, "WE low holds memory");
   f.build();
   assert.equal(f.value(ram), 0xa5n, "rebuild preserves RAM state when its shape is unchanged");
+});
+
+test("RAM maps a sparse 64-bit address window without scalar expansion and preserves held-high edges", () => {
+  const f = fixture();
+  const base = 0x0020000000000001n, end = base + 0xffn;
+  const address = f.add("input", 64), data = f.add("input", 64), we = f.add("input"), clock = f.add("input");
+  const ram = f.add("ram", 64, {
+    addressWidth: 64,
+    ramBase: base,
+    ramEnd: end,
+    ramCells: new Map([
+      [base, 0x8000000100000001n],
+      [end, 0xffffffffffffffffn],
+    ]),
+  });
+  f.link(address, ram, 0); f.link(data, ram, 1); f.link(we, ram, 2); f.link(clock, ram, 3);
+  const firstRuntime = f.build();
+  assert.equal(firstRuntime.scalarNodes, 64 + 64 + 1 + 1 + 64,
+    "RAM scalar cost is its output width, not 2^addressWidth storage");
+  assert.equal(f.value(ram), 0n, "unmapped address zero reads as zero");
+
+  f.set(address, base);
+  assert.equal(f.value(ram), 0x8000000100000001n);
+  f.set(address, end);
+  assert.equal(f.value(ram), 0xffffffffffffffffn, "last mapped address remains exact above 2^53");
+
+  const middle = base + 0x42n;
+  f.set(address, middle); f.set(data, 0xfedcba9876543210n); f.set(we, 1n); f.set(clock, 1n);
+  assert.equal(f.value(ram), 0xfedcba9876543210n);
+  assert.equal(readRuntimeRamCell(wasm, f.runtime.handles.get(ram.documentId), middle), 0xfedcba9876543210n);
+
+  f.set(data, 0x1234n);
+  f.build();
+  assert.equal(readRuntimeRamCell(wasm, f.runtime.handles.get(ram.documentId), middle), 0xfedcba9876543210n,
+    "rebuild while CLK is held high does not invent a second rising edge");
+
+  f.set(clock, 0n); f.set(address, base - 1n); f.set(data, 0x55aan); f.set(clock, 1n);
+  assert.equal(f.value(ram), 0n, "outside-range read is zero");
+  const snapshot = snapshotRuntimeRamStates(wasm, f.runtime).get(`${ram.documentId}/ram`);
+  assert.equal(snapshot.size, 3, "outside-range write is ignored and sparse storage only contains written/nonzero cells");
+
+  setRuntimeRamCell(wasm, f.runtime.handles.get(ram.documentId), ram, base + 1n, 0x0123456789abcdefn);
+  assert.equal(readRuntimeRamCell(wasm, f.runtime.handles.get(ram.documentId), base + 1n), 0x0123456789abcdefn);
+  assert.equal(ram.ramCells.get(base + 1n), 0x0123456789abcdefn, "direct editor writes also update the persisted RAM image");
+  assert.throws(() => setRuntimeRamCell(wasm, f.runtime.handles.get(ram.documentId), ram, end + 1n, 1n), /outside/);
 });
 
 test("Make chip infers compact interface ports from open pins and terminal outputs", () => {
@@ -432,10 +481,50 @@ test("custom RAM exposes independent address and data groups with fixed WE and C
   assert.ok(addressParam); assert.ok(dataParam); assert.notEqual(addressParam.id,dataParam.id);
   assert.ok(!def.parameters.some((p) => p.label.includes("WE") || p.label.includes("CLK")));
   const chip = f.add("custom",1,{definitionId:1});
-  changeCustomWidth(chip,addressParam.id,6,f.lookup);
+  changeCustomWidth(chip,addressParam.id,64,f.lookup);
   changeCustomWidth(chip,dataParam.id,32,f.lookup);
-  assert.deepEqual(inputDefs(chip,f.lookup).map((p) => p.width),[6,32,1,1]);
+  assert.deepEqual(inputDefs(chip,f.lookup).map((p) => p.width),[64,32,1,1]);
   assert.equal(outputDefs(chip,f.lookup)[0].width,32);
+});
+
+test("custom RAM instances keep isolated sparse runtime state across rebuilds", () => {
+  const f = fixture();
+  const base = 0x0020000000000001n, end = base + 0xffn;
+  const addr = f.add("input",64,{label:"ADDR"}), data = f.add("input",64,{label:"DATA"});
+  const we = f.add("input",1,{label:"WE"}), clk = f.add("input",1,{label:"CLK"});
+  const ram = f.add("ram",64,{
+    addressWidth:64,
+    ramBase:base,
+    ramEnd:end,
+    ramCells:new Map([[base,0x11n]]),
+  });
+  const out = f.add("output",64,{label:"Q"});
+  f.link(addr,ram,0); f.link(data,ram,1); f.link(we,ram,2); f.link(clk,ram,3); f.link(ram,out);
+  const def = createDefinition(f.nodes,"WIDE MAPPED RAM",1); f.definitions.push(def);
+
+  const first = f.add("custom",1,{definitionId:def.id});
+  const second = f.add("custom",1,{definitionId:def.id});
+  first.inputs = [null,null,null,null]; second.inputs = [null,null,null,null];
+  f.build();
+
+  const firstEntry = [...f.runtime.rams.values()].find((entry) => entry.key.startsWith(`${first.documentId}/`));
+  const secondEntry = [...f.runtime.rams.values()].find((entry) => entry.key.startsWith(`${second.documentId}/`));
+  assert.ok(firstEntry); assert.ok(secondEntry); assert.notEqual(firstEntry.key,secondEntry.key);
+  assert.equal(readRuntimeRamCell(wasm,firstEntry.handle,base),0x11n);
+  assert.equal(readRuntimeRamCell(wasm,secondEntry.handle,base),0x11n);
+
+  const resolvedRam = resolveCustom(first,f.lookup).nodes.find((node) => node.kind === "ram");
+  assert.ok(resolvedRam);
+  setRuntimeRamCell(wasm,firstEntry.handle,resolvedRam,base + 7n,0xfedcba9876543210n);
+  assert.equal(readRuntimeRamCell(wasm,firstEntry.handle,base + 7n),0xfedcba9876543210n);
+  assert.equal(readRuntimeRamCell(wasm,secondEntry.handle,base + 7n),0n,
+    "writing one custom RAM instance must not mutate another instance of the same definition");
+
+  f.build();
+  const firstAfter = [...f.runtime.rams.values()].find((entry) => entry.key === firstEntry.key);
+  const secondAfter = [...f.runtime.rams.values()].find((entry) => entry.key === secondEntry.key);
+  assert.equal(readRuntimeRamCell(wasm,firstAfter.handle,base + 7n),0xfedcba9876543210n);
+  assert.equal(readRuntimeRamCell(wasm,secondAfter.handle,base + 7n),0n);
 });
 
 test("custom MUX keeps address and data width groups independent", () => {

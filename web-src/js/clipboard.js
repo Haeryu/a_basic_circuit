@@ -1,8 +1,11 @@
 import {
   MAX_ADDRESS_WIDTH,
+  MAX_RAM_ADDRESS_WIDTH,
   MAX_WIDTH,
+  cloneRamCells,
   createDefinition,
   makeNode,
+  ramAddressLimit,
   resolveCustom,
   validNodeShape,
 } from "./circuit.js";
@@ -20,6 +23,7 @@ const MAX_TOTAL_DEFINITION_NODES = 20_000;
 const MAX_INPUTS = 4_096;
 const MAX_SOURCE_PORT = 4_095;
 const MAX_PARAMETERS = 4_096;
+const MAX_RAM_CELLS = 250_000;
 const MAX_LABEL_LENGTH = 80;
 const CLOCK_INPUT_SLOTS = 3; // CLK, LOAD, DATA. Legacy payloads may contain only CLK.
 
@@ -87,7 +91,8 @@ function nodeFields(raw, context, allowedKinds = DOCUMENT_KINDS) {
   const kind = text(raw.kind, `${context}.kind`, 24, false);
   if (!allowedKinds.has(kind)) invalid(`${context}.kind is not supported`);
   const width = integer(raw.width, `${context}.width`, 1, MAX_WIDTH);
-  const addressWidth = integer(raw.addressWidth, `${context}.addressWidth`, 1, MAX_ADDRESS_WIDTH);
+  const addressWidth = integer(raw.addressWidth, `${context}.addressWidth`, 1,
+    kind === "ram" ? MAX_RAM_ADDRESS_WIDTH : MAX_ADDRESS_WIDTH);
   const splitWidth = integer(raw.splitWidth, `${context}.splitWidth`, 1, MAX_WIDTH);
   if (!validNodeShape(kind, width, addressWidth, splitWidth)) invalid(`${context} has an invalid ${kind} shape`);
   return { kind, width, addressWidth, splitWidth };
@@ -151,6 +156,67 @@ function decodedInputValue(value, kind, width, context) {
   if (result >= (1n << BigInt(width))) invalid(`${context}.inputValue does not fit its width`);
   if ((kind === "clock" || kind === "oscillator") && result !== 0n) invalid(`${context} clocks must be copied low`);
   return result;
+}
+
+function unsignedBigIntString(value, context, maximum) {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]{0,19})$/.test(value)) {
+    invalid(`${context} must be an unsigned decimal string`);
+  }
+  const result = BigInt(value);
+  if (result > maximum) invalid(`${context} is out of range`);
+  return result;
+}
+
+function encodedRamFields(node, width, addressWidth, context) {
+  const limit = ramAddressLimit(addressWidth);
+  const base = node.ramBase ?? 0n;
+  const end = node.ramEnd ?? limit;
+  if (typeof base !== "bigint" || typeof end !== "bigint" || base < 0n || end < base || end > limit) {
+    invalid(`${context} has an invalid RAM mapped range`);
+  }
+  let cells;
+  try { cells = cloneRamCells(node.ramCells); }
+  catch { invalid(`${context}.ramCells must be a RAM cell map`); }
+  if (cells.size > MAX_RAM_CELLS) invalid(`${context}.ramCells has too many entries`);
+  const wordLimit = (1n << BigInt(width)) - 1n;
+  const entries = [];
+  for (const [address, word] of cells) {
+    if (typeof address !== "bigint" || typeof word !== "bigint" || address < base || address > end) {
+      invalid(`${context}.ramCells contains an address outside the mapped range`);
+    }
+    if (word < 0n || word > wordLimit) invalid(`${context}.ramCells contains a value wider than ${width} bits`);
+    if (word !== 0n) entries.push([address.toString(10), word.toString(10)]);
+  }
+  entries.sort((a, b) => {
+    const left = BigInt(a[0]), right = BigInt(b[0]);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  return { ramBase: base.toString(10), ramEnd: end.toString(10), ramCells: entries };
+}
+
+function decodedRamFields(raw, width, addressWidth, context) {
+  const limit = ramAddressLimit(addressWidth);
+  const hasAny = raw.ramBase !== undefined || raw.ramEnd !== undefined || raw.ramCells !== undefined;
+  if (!hasAny) return { ramBase: 0n, ramEnd: limit, ramCells: new Map() };
+  if (raw.ramBase === undefined || raw.ramEnd === undefined || raw.ramCells === undefined) {
+    invalid(`${context} RAM mapping requires ramBase, ramEnd, and ramCells together`);
+  }
+  const base = unsignedBigIntString(raw.ramBase, `${context}.ramBase`, limit);
+  const end = unsignedBigIntString(raw.ramEnd, `${context}.ramEnd`, limit);
+  if (base > end) invalid(`${context}.ramBase must not exceed ramEnd`);
+  const rawCells = array(raw.ramCells, `${context}.ramCells`, MAX_RAM_CELLS);
+  const wordLimit = (1n << BigInt(width)) - 1n;
+  const ramCells = new Map();
+  for (const [index, entry] of rawCells.entries()) {
+    const entryContext = `${context}.ramCells[${index}]`;
+    if (!Array.isArray(entry) || entry.length !== 2) invalid(`${entryContext} must be an [address, value] pair`);
+    const address = unsignedBigIntString(entry[0], `${entryContext}[0]`, limit);
+    if (address < base || address > end) invalid(`${entryContext}[0] is outside the mapped range`);
+    if (ramCells.has(address)) invalid(`${entryContext}[0] duplicates a RAM address`);
+    const word = unsignedBigIntString(entry[1], `${entryContext}[1]`, wordLimit);
+    if (word !== 0n) ramCells.set(address, word);
+  }
+  return { ramBase: base, ramEnd: end, ramCells };
 }
 
 function inputArray(value, context) {
@@ -262,6 +328,7 @@ function definitionSource(definition, context = "definition", definitionIndex = 
       label: text(labels.get(spec.localId) ?? spec.label ?? "", `${nodeContext}.label`),
       inputs,
     };
+    if (fields.kind === "ram") Object.assign(result, encodedRamFields(spec, fields.width, fields.addressWidth, nodeContext));
     if (fields.kind === "custom") {
       const definitionId = id(spec.definitionId, `${nodeContext}.definitionId`);
       if (definitionIndex != null && !definitionIndex.has(definitionId)) {
@@ -331,6 +398,7 @@ function rebuildDefinition(source, definitionId, context = "definition", resolve
     node.widthParameters = widthParameters;
     node.label = label;
     node.inputValue = 0n;
+    if (fields.kind === "ram") Object.assign(node, decodedRamFields(spec, fields.width, fields.addressWidth, nodeContext));
     if (fields.kind === "clock") {
       node.inputRadix = inputRadix(spec.inputRadix ?? 16, `${nodeContext}.inputRadix`);
     } else if (spec.inputRadix !== undefined) {
@@ -422,6 +490,7 @@ function encodeDocumentNode(node, selectedIndex, definitionIndex, normalizedDefi
     result.clockRunning = false;
   }
   if (fields.kind === "display") Object.assign(result, ledFields(node, fields.width, context));
+  if (fields.kind === "ram") Object.assign(result, encodedRamFields(node, fields.width, fields.addressWidth, context));
   validateSpecialInputs(fields.kind, inputs, result.ledMode, context);
   return result;
 }
@@ -772,6 +841,7 @@ function decodePayload(payload, {
     node.widthParameters = widthParameters;
     node.label = text(raw.label, `${context}.label`);
     node.inputValue = decodedInputValue(raw.inputValue, fields.kind, fields.width, context);
+    if (fields.kind === "ram") Object.assign(node, decodedRamFields(raw, fields.width, fields.addressWidth, context));
     if (fields.kind === "input") {
       node.inputRadix = inputRadix(raw.inputRadix, `${context}.inputRadix`);
     } else if (fields.kind === "clock") {

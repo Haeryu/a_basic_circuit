@@ -397,7 +397,7 @@ pub const Builder = struct {
         };
         try self.reserveScalar(count);
         if (kind == .display) return;
-        const style: StateStyle = if (isComposite(kind)) .native else if (kind == .clock) .count else if (kind == .oscillator) .oscillator else .bit;
+        const style: StateStyle = if (isComposite(kind) or kind == .ram) .native else if (kind == .clock) .count else if (kind == .oscillator) .oscillator else .bit;
         const state_kind: Semantics.Kind = if (interface_input and kind == .input) .buffer else kind;
         const restore = !(kind == .oscillator or (!has_local and kind == .input and !interface_input));
         for (0..count) |index| try self.states.append(self.allocator, .{
@@ -519,7 +519,7 @@ pub const Builder = struct {
             max_scalar_nodes - (self.scalar_nodes - expected),
         ) catch |err| return mapCompilerError(err);
         if (self.primitive_scratch.created.items.len != expected) return error.CircuitFailure;
-        const style: StateStyle = if (kind == .clock) .count else if (kind == .oscillator) .oscillator else .bit;
+        const style: StateStyle = if (kind == .ram) .native else if (kind == .clock) .count else if (kind == .oscillator) .oscillator else .bit;
         const state_kind: Semantics.Kind = if (interface_input and kind == .input) .buffer else kind;
         const restore = !(kind == .oscillator or (!has_local and kind == .input and !interface_input));
         try self.appendStates(root_document_id, local_id, has_local, style, state_kind, restore, self.primitive_scratch.created.items);
@@ -871,7 +871,8 @@ pub const Builder = struct {
 
 fn validNode(spec: NodeSpec) bool {
     if (spec.width == 0 or spec.width > Semantics.max_width) return false;
-    if (spec.address_width == 0 or spec.address_width > Semantics.max_address_width) return false;
+    const address_max: u8 = if (spec.kind == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (spec.address_width == 0 or spec.address_width > address_max) return false;
     if ((spec.kind == .split or spec.kind == .join) and (spec.split_width == 0 or spec.split_width >= spec.width)) return false;
     if (spec.kind == .oscillator and spec.width != 1) return false;
     return true;
@@ -891,7 +892,7 @@ fn validChild(spec: ChildSpec) bool {
 
 fn isComposite(kind: Semantics.Kind) bool {
     return switch (kind) {
-        .adder, .register, .alu, .ram, .mux, .demux, .decoder, .split, .join => true,
+        .adder, .register, .alu, .mux, .demux, .decoder, .split, .join => true,
         else => false,
     };
 }
@@ -971,4 +972,40 @@ test "custom instance aliases interface ports and reports internal mismatch" {
     try std.testing.expectEqual(@as(u32, 8), builder.handleInputWidth(handle, 0));
     try std.testing.expectEqual(@as(u32, 1), builder.handleOutputCount(handle));
     try std.testing.expectEqual(@as(usize, 8), builder.handleOutputBus(handle, 0).?.len);
+}
+
+test "wide RAM document planning stays linear in data width" {
+    var builder = Builder.init(std.testing.allocator);
+    defer builder.deinit();
+    const ram = try builder.addNode(.{
+        .document_id = 1,
+        .kind = .ram,
+        .width = 64,
+        .address_width = 64,
+        .split_width = 1,
+        .rgb = false,
+    });
+    try builder.analyze();
+    try std.testing.expectEqual(@as(usize, 64), builder.scalar_nodes);
+    try std.testing.expectEqual(@as(usize, 64), builder.states.items.len);
+    try std.testing.expectEqual(StateStyle.native, builder.states.items[0].style);
+    try std.testing.expect(builder.states.items[0].restore);
+
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+    try builder.compile(&circuit);
+    const handle = builder.topHandle(ram).?;
+    try std.testing.expectEqual(@as(u32, 4), builder.handleInputCount(handle));
+    try std.testing.expectEqual(@as(u32, 64), builder.handleInputWidth(handle, 0));
+    try std.testing.expectEqual(@as(u32, 64), builder.handleInputWidth(handle, 1));
+    try std.testing.expectEqual(@as(usize, 64), builder.handleOutputBus(handle, 0).?.len);
+
+    try std.testing.expectError(error.InvalidShape, builder.addNode(.{
+        .document_id = 2,
+        .kind = .decoder,
+        .width = 1,
+        .address_width = 7,
+        .split_width = 1,
+        .rgb = false,
+    }));
 }

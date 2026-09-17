@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const max_width: u8 = 64;
 pub const max_address_width: u8 = 6;
+pub const max_ram_address_width: u8 = 64;
 
 pub const Kind = enum(u8) {
     input,
@@ -64,7 +65,8 @@ pub fn kind(raw: u32) ?Kind {
 
 pub fn validShape(k: Kind, width: u32, address_width: u32, split_width: u32) bool {
     if (width == 0 or width > max_width) return false;
-    if (address_width == 0 or address_width > max_address_width) return false;
+    const address_max: u32 = if (k == .ram) max_ram_address_width else max_address_width;
+    if (address_width == 0 or address_width > address_max) return false;
     if (split_width == 0 or split_width > max_width) return false;
     if (k == .oscillator and width != 1) return false;
     if ((k == .split or k == .join) and (width < 2 or split_width >= width)) return false;

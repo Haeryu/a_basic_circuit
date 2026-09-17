@@ -104,7 +104,8 @@ pub fn compile(
 ) !void {
     scratch.clearRetainingCapacity();
     if (width == 0 or width > Semantics.max_width or budget < width) return error.BudgetExceeded;
-    if (address_width == 0 or address_width > Semantics.max_address_width) return error.InvalidShape;
+    const address_max: u8 = if (kind == .ram) Semantics.max_ram_address_width else Semantics.max_address_width;
+    if (address_width == 0 or address_width > address_max) return error.InvalidShape;
     if ((kind == .split or kind == .join) and (split_width == 0 or split_width >= width)) return error.InvalidShape;
     if (kind == .display or kind == .mux or kind == .demux or kind == .decoder or kind == .adder or kind == .split or kind == .join) {
         return error.InvalidKind;
@@ -113,6 +114,47 @@ pub fn compile(
 
     try scratch.input_offsets.append(scratch.allocator, 0);
     try scratch.output_offsets.append(scratch.allocator, 0);
+
+    if (kind == .ram) {
+        if (interface_input) return error.InvalidKind;
+        const first = try circuit.addRam(width, address_width);
+        var ids = std.ArrayListUnmanaged(Circuit.NodeId).empty;
+        defer ids.deinit(scratch.allocator);
+        try ids.ensureTotalCapacity(scratch.allocator, width);
+        const first_raw: u32 = @intFromEnum(first);
+        for (0..width) |bit| {
+            const id: Circuit.NodeId = @enumFromInt(first_raw + @as(u32, @intCast(bit)));
+            ids.appendAssumeCapacity(id);
+            try scratch.created.append(scratch.allocator, id);
+        }
+
+        var address_targets = std.ArrayListUnmanaged(Target).empty;
+        defer address_targets.deinit(scratch.allocator);
+        try address_targets.ensureTotalCapacity(scratch.allocator, address_width);
+        for (0..address_width) |bit| address_targets.appendAssumeCapacity(.{
+            .node = first,
+            .pin = @intCast(bit),
+            .source_bit = @intCast(bit),
+        });
+        try appendPort(scratch, address_width, address_targets.items);
+
+        var data_targets = std.ArrayListUnmanaged(Target).empty;
+        defer data_targets.deinit(scratch.allocator);
+        try data_targets.ensureTotalCapacity(scratch.allocator, width);
+        for (ids.items, 0..) |id, bit| data_targets.appendAssumeCapacity(.{
+            .node = id,
+            .pin = 64,
+            .source_bit = @intCast(bit),
+        });
+        try appendPort(scratch, width, data_targets.items);
+
+        const write_enable_target = [_]Target{.{ .node = first, .pin = 65, .source_bit = 0 }};
+        const clock_target = [_]Target{.{ .node = first, .pin = 66, .source_bit = 0 }};
+        try appendPort(scratch, 1, &write_enable_target);
+        try appendPort(scratch, 1, &clock_target);
+        try appendOutput(scratch, ids.items);
+        return;
+    }
 
     if (kind == .clock) {
         const first = try circuit.addCounter(width);
@@ -213,4 +255,19 @@ test "clock primitive exposes shared control targets and lane-local data" {
     try std.testing.expectEqual(@as(usize, 64), scratch.inputTargets(2).?.len);
     try std.testing.expectEqual(@as(u8, 63), scratch.inputTargets(2).?[63].source_bit);
     try std.testing.expectEqual(@as(usize, 64), scratch.outputBus(0).?.len);
+}
+
+test "RAM primitive accepts a sixty four bit address bus without expanding the address space" {
+    var circuit = Circuit.init(std.testing.allocator);
+    defer circuit.deinit();
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    try compile(&circuit, &scratch, .ram, 64, 64, 1, false, 64);
+    try std.testing.expectEqual(@as(usize, 4), scratch.inputCount());
+    try std.testing.expectEqual(@as(u8, 64), scratch.input_widths.items[0]);
+    try std.testing.expectEqual(@as(u8, 64), scratch.input_widths.items[1]);
+    try std.testing.expectEqual(@as(usize, 64), scratch.created.items.len);
+    try std.testing.expectEqual(@as(usize, 64), scratch.outputBus(0).?.len);
+    try std.testing.expectEqual(@as(usize, 64), circuit.nodes.items.len);
+    try std.testing.expectError(error.InvalidShape, compile(&circuit, &scratch, .decoder, 1, 7, 1, false, 64));
 }

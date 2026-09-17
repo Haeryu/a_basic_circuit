@@ -182,6 +182,48 @@ test("simulation outputs, oscillator level and play state, and native counter st
   assert.equal(Object.hasOwn(byId(history.current, 1), "inputValue"), false);
 });
 
+test("RAM mapped range and sparse cell edits undo and redo without aliasing", () => {
+  const history = new DocumentHistory();
+  const ram = node(30, "ram", 0, 0, 64, {
+    addressWidth: 64,
+    ramBase: 0x0020000000000001n,
+    ramEnd: 0x00200000000000ffn,
+    ramCells: new Map([[0x0020000000000001n, 0x1111222233334444n]]),
+  });
+  history.reset([ram], []);
+  const baseline = history.current.nodes[0];
+  assert.equal(Object.isFrozen(baseline.ramCells), true);
+
+  ram.ramBase = 0x0020000000000010n;
+  ram.ramEnd = 0x0020000000000200n;
+  ram.ramCells = new Map([
+    [0x0020000000000010n, 0xffffffffffffffffn],
+    [0x0020000000000100n, 0x8000000100000001n],
+  ]);
+  assert.equal(history.record([ram], []), true);
+  ram.ramCells.set(0x0020000000000010n, 0n);
+  assert.deepEqual(history.current.nodes[0].ramCells, [
+    [0x0020000000000010n, 0xffffffffffffffffn],
+    [0x0020000000000100n, 0x8000000100000001n],
+  ], "captured RAM image does not alias the live Map");
+
+  const undone = history.undo().nodes[0];
+  assert.equal(undone.ramBase, 0x0020000000000001n);
+  assert.deepEqual(undone.ramCells, [[0x0020000000000001n, 0x1111222233334444n]]);
+  const redone = history.redo().nodes[0];
+  assert.equal(redone.ramEnd, 0x0020000000000200n);
+  assert.deepEqual(redone.ramCells, [
+    [0x0020000000000010n, 0xffffffffffffffffn],
+    [0x0020000000000100n, 0x8000000100000001n],
+  ]);
+
+  // Runtime-only simulation state is deliberately not represented in the
+  // descriptor and therefore cannot create editor history.
+  history.reset([ram], []);
+  ram.runtimeRamCells = new Map([[0x0020000000000011n, 0x55n]]);
+  assert.equal(history.record([ram], []), false);
+});
+
 test("a no-op after undo preserves redo while a real branch clears it", () => {
   const history = new DocumentHistory();
   const input = node(1, "input", 0, 0, 8);

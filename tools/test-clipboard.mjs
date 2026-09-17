@@ -105,6 +105,82 @@ test("selection paste assigns fresh ids, offsets positions, and keeps only inter
   assert.equal(source.label, "DATA");
 });
 
+test("mapped RAM clipboard keeps 64-bit addresses and sparse cells losslessly", () => {
+  const base = 0x0020000000000001n, end = base + 0xffn;
+  const ram = node(40, "ram", 100, 200, 64, {
+    addressWidth: 64,
+    ramBase: base,
+    ramEnd: end,
+    ramCells: new Map([
+      [base, 0x8000000100000001n],
+      [end, 0xffffffffffffffffn],
+    ]),
+  });
+  const text = serializeSelection([ram], new Set([40]), []);
+  const encoded = JSON.parse(text).nodes[0];
+  assert.equal(encoded.ramBase, base.toString(10));
+  assert.equal(encoded.ramEnd, end.toString(10));
+  assert.deepEqual(encoded.ramCells, [
+    [base.toString(10), "9223372041149743105"],
+    [end.toString(10), "18446744073709551615"],
+  ]);
+
+  const pasted = deserializeSelection(text, {
+    nextDocumentId: 100,
+    nextDefinitionId: 1,
+    definitions: [],
+    x: 0,
+    y: 0,
+  });
+  assert.equal(pasted.nodes[0].addressWidth, 64);
+  assert.equal(pasted.nodes[0].ramBase, base);
+  assert.equal(pasted.nodes[0].ramEnd, end);
+  assert.deepEqual([...pasted.nodes[0].ramCells], [
+    [base, 0x8000000100000001n],
+    [end, 0xffffffffffffffffn],
+  ]);
+
+  const legacy = JSON.parse(text);
+  delete legacy.nodes[0].ramBase; delete legacy.nodes[0].ramEnd; delete legacy.nodes[0].ramCells;
+  const legacyRam = deserializeSelection(JSON.stringify(legacy), {
+    nextDocumentId: 200, nextDefinitionId: 1, definitions: [], x: 0, y: 0,
+  }).nodes[0];
+  assert.equal(legacyRam.ramBase, 0n);
+  assert.equal(legacyRam.ramEnd, 0xffffffffffffffffn);
+  assert.equal(legacyRam.ramCells.size, 0);
+
+  const invalid = JSON.parse(text);
+  invalid.nodes[0].ramCells.push([(end + 1n).toString(10), "1"]);
+  assert.throws(() => deserializeSelection(JSON.stringify(invalid), {
+    nextDocumentId: 300, nextDefinitionId: 1, definitions: [], x: 0, y: 0,
+  }), /outside the mapped range/);
+});
+
+test("chip packages preserve mapped RAM images inside custom definitions", () => {
+  const address = node(1, "input", 0, 0, 64, { label: "ADDR" });
+  const data = node(2, "input", 0, 100, 64, { label: "DATA" });
+  const we = node(3, "input", 0, 200, 1, { label: "WE" });
+  const clock = node(4, "input", 0, 300, 1, { label: "CLK" });
+  const base = 0x1000000000000000n, end = base + 0x3fn;
+  const ram = node(5, "ram", 300, 120, 64, {
+    addressWidth: 64, ramBase: base, ramEnd: end,
+    ramCells: new Map([[base + 7n, 0xabcdef0123456789n]]),
+  });
+  const output = node(6, "output", 650, 120, 64, { label: "Q" });
+  link(address, ram, 0); link(data, ram, 1); link(we, ram, 2); link(clock, ram, 3); link(ram, output);
+  const definition = createDefinition([address, data, we, clock, ram, output], "MAPPED RAM", 77);
+  const text = serializeChipPackage(definition.id, [definition]);
+  const encodedRam = JSON.parse(text).definitions[0].nodes.find((value) => value.kind === "ram");
+  assert.deepEqual([encodedRam.ramBase, encodedRam.ramEnd], [base.toString(10), end.toString(10)]);
+  assert.deepEqual(encodedRam.ramCells, [[(base + 7n).toString(10), "12379813738877118345"]]);
+
+  const loaded = deserializeChipPackage(text, { definitions: [], nextDefinitionId: 200 });
+  const loadedRam = loaded.definitions[0].nodes.find((value) => value.kind === "ram");
+  assert.equal(loadedRam.ramBase, base);
+  assert.equal(loadedRam.ramEnd, end);
+  assert.equal(loadedRam.ramCells.get(base + 7n), 0xabcdef0123456789n);
+});
+
 test("loadable counter pins and colors roundtrip while legacy short clocks gain empty LOAD and DATA slots", () => {
   const edge = node(1, "input", 0, 0, 1, { inputValue: 1n });
   const load = node(2, "input", 0, 100, 1, { inputValue: 1n });

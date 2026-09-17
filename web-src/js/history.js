@@ -71,6 +71,32 @@ function inputValue(node) {
   return value;
 }
 
+function ramEntries(value) {
+  if (value == null) return [];
+  const entries = value instanceof Map ? [...value] : Array.isArray(value) ? [...value] : null;
+  if (!entries) throw new TypeError("ramCells must be a Map or entry array");
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "bigint" || typeof entry[1] !== "bigint") {
+      throw new TypeError("ramCells entries must contain BigInt address/value pairs");
+    }
+  }
+  entries.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return entries;
+}
+
+function captureRamCells(value) {
+  return Object.freeze(ramEntries(value).map(([address, word]) => Object.freeze([address, word])));
+}
+
+function sameRamCells(saved, live) {
+  const entries = ramEntries(live);
+  if (saved.length !== entries.length) return false;
+  for (let index = 0; index < saved.length; index += 1) {
+    if (!Object.is(saved[index][0], entries[index][0]) || !Object.is(saved[index][1], entries[index][1])) return false;
+  }
+  return true;
+}
+
 function captureNode(node) {
   if (node === null || typeof node !== "object" || Array.isArray(node)) {
     throw new TypeError("nodes must contain objects");
@@ -101,6 +127,13 @@ function captureNode(node) {
     saved.ledRows = node.ledRows;
     saved.ledMode = node.ledMode;
     saved.ledColor = node.ledColor;
+  } else if (node.kind === "ram") {
+    if (typeof node.ramBase !== "bigint" || typeof node.ramEnd !== "bigint") {
+      throw new TypeError("RAM mapped range must use BigInt addresses");
+    }
+    saved.ramBase = node.ramBase;
+    saved.ramEnd = node.ramEnd;
+    saved.ramCells = captureRamCells(node.ramCells);
   }
 
   return Object.freeze(saved);
@@ -131,6 +164,10 @@ function descriptorMatchesNode(saved, live) {
       Object.is(saved.ledRows, live.ledRows) &&
       Object.is(saved.ledMode, live.ledMode) &&
       Object.is(saved.ledColor, live.ledColor);
+  }
+  if (saved.kind === "ram") {
+    return Object.is(saved.ramBase, live.ramBase) && Object.is(saved.ramEnd, live.ramEnd) &&
+      sameRamCells(saved.ramCells, live.ramCells);
   }
   return true;
 }
@@ -163,6 +200,9 @@ function sameDescriptor(a, b) {
       Object.is(a.ledRows, b.ledRows) &&
       Object.is(a.ledMode, b.ledMode) &&
       Object.is(a.ledColor, b.ledColor);
+  }
+  if (a.kind === "ram") {
+    return Object.is(a.ramBase, b.ramBase) && Object.is(a.ramEnd, b.ramEnd) && sameRamCells(a.ramCells, b.ramCells);
   }
   return true;
 }
@@ -233,6 +273,10 @@ function descriptorBytes(node) {
   if (node.kind === "input") bytes += bigintBytes(node.inputValue) + 8;
   else if (node.kind === "oscillator") bytes += 8;
   else if (node.kind === "display") bytes += 32 + stringBytes(node.ledMode) + stringBytes(node.ledColor);
+  else if (node.kind === "ram") {
+    bytes += bigintBytes(node.ramBase) + bigintBytes(node.ramEnd);
+    for (const [address, word] of node.ramCells) bytes += 16 + bigintBytes(address) + bigintBytes(word);
+  }
   return bytes;
 }
 

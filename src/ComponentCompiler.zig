@@ -101,7 +101,6 @@ pub fn scalarCount(kind: Semantics.Kind, width: u8, address_width: u8) ?usize {
         .adder => 7 * w + 1,
         .register => 5 * w + 3,
         .alu => 17 * w + 7,
-        .ram => (a + w + 2) + a + lanes * (a - 1) + 2 * lanes + 4 * w * lanes + 3 * w * (lanes - 1),
         .mux => a + lanes * w + a + 3 * w * (lanes - 1),
         .decoder => 2 * a + lanes * (a - 1),
         .demux => w + 2 * a + lanes * (a - 1 + w),
@@ -112,7 +111,7 @@ pub fn scalarCount(kind: Semantics.Kind, width: u8, address_width: u8) ?usize {
 pub fn compile(circuit: *Circuit, scratch: *Scratch, kind: Semantics.Kind, width: u8, address_width: u8, split_width: u8, budget: usize) !void {
     scratch.clearRetainingCapacity();
     switch (kind) {
-        .adder, .register, .alu, .ram, .mux, .demux, .decoder, .split, .join => {},
+        .adder, .register, .alu, .mux, .demux, .decoder, .split, .join => {},
         else => return error.InvalidKind,
     }
     if ((scalarCount(kind, width, address_width) orelse return error.InvalidKind) > budget) return error.BudgetExceeded;
@@ -187,71 +186,6 @@ pub fn compile(circuit: *Circuit, scratch: *Scratch, kind: Semantics.Kind, width
         const add_selected = try builder.gate(.and2, add_selected_low, inverse1);
         try appendOutputBus(scratch, result.items);
         try appendOutputBus(scratch, &.{add_selected});
-        return;
-    }
-
-    if (kind == .ram) {
-        const address = scratch.inputBus(0).?;
-        const data = scratch.inputBus(1).?;
-        const write_enable = scratch.inputBus(2).?[0];
-        const clock = scratch.inputBus(3).?[0];
-        var inverse_address = std.ArrayListUnmanaged(Circuit.NodeId).empty;
-        defer inverse_address.deinit(scratch.allocator);
-        try inverse_address.ensureTotalCapacity(scratch.allocator, address_width);
-        for (address) |bit| inverse_address.appendAssumeCapacity(try builder.gate(.not, bit, null));
-
-        const lane_count: usize = @as(usize, 1) << @intCast(address_width);
-        var decoded = std.ArrayListUnmanaged(Circuit.NodeId).empty;
-        defer decoded.deinit(scratch.allocator);
-        try decoded.ensureTotalCapacity(scratch.allocator, lane_count);
-        for (0..lane_count) |lane| {
-            var selected = if ((lane & 1) != 0) address[0] else inverse_address.items[0];
-            for (1..address_width) |bit| {
-                const mask: usize = @as(usize, 1) << @intCast(bit);
-                selected = try builder.gate(.and2, selected, if ((lane & mask) != 0) address[bit] else inverse_address.items[bit]);
-            }
-            decoded.appendAssumeCapacity(selected);
-        }
-
-        var words = std.ArrayListUnmanaged(Circuit.NodeId).empty;
-        defer words.deinit(scratch.allocator);
-        try words.ensureTotalCapacity(scratch.allocator, lane_count * width);
-        for (decoded.items) |select| {
-            const load = try builder.gate(.and2, select, write_enable);
-            const inverse_load = try builder.gate(.not, load, null);
-            for (0..width) |bit| {
-                const q = try builder.add(.dff);
-                const next = try builder.mux2(load, inverse_load, q, data[bit]);
-                try circuit.connect(next, q, 0);
-                try circuit.connect(clock, q, 1);
-                words.appendAssumeCapacity(q);
-            }
-        }
-
-        var level = std.ArrayListUnmanaged(Circuit.NodeId).empty;
-        defer level.deinit(scratch.allocator);
-        try level.appendSlice(scratch.allocator, words.items);
-        var lanes = lane_count;
-        for (0..address_width) |select_bit| {
-            const select = address[select_bit];
-            const inverse_select = inverse_address.items[select_bit];
-            var next = std.ArrayListUnmanaged(Circuit.NodeId).empty;
-            errdefer next.deinit(scratch.allocator);
-            try next.ensureTotalCapacity(scratch.allocator, (lanes / 2) * width);
-            var lane: usize = 0;
-            while (lane < lanes) : (lane += 2) {
-                for (0..width) |bit| next.appendAssumeCapacity(try builder.mux2(
-                    select,
-                    inverse_select,
-                    level.items[lane * width + bit],
-                    level.items[(lane + 1) * width + bit],
-                ));
-            }
-            level.deinit(scratch.allocator);
-            level = next;
-            lanes /= 2;
-        }
-        try appendOutputBus(scratch, level.items[0..width]);
         return;
     }
 
@@ -360,11 +294,10 @@ test "compile 4-bit selector mux keeps eight-bit output" {
     try std.testing.expectEqual(@as(usize, 8), scratch.outputBus(0).?.len);
 }
 
-test "register alu and ram lowering matches planned scalar counts" {
+test "register and alu lowering matches planned scalar counts" {
     const cases = [_]struct { kind: Semantics.Kind, width: u8, address: u8, inputs: usize, outputs: usize }{
         .{ .kind = .register, .width = 8, .address = 1, .inputs = 3, .outputs = 1 },
         .{ .kind = .alu, .width = 8, .address = 1, .inputs = 3, .outputs = 2 },
-        .{ .kind = .ram, .width = 8, .address = 3, .inputs = 4, .outputs = 1 },
     };
     for (cases) |case| {
         var circuit = Circuit.init(std.testing.allocator);
