@@ -211,7 +211,7 @@ pub const Builder = struct {
         }
 
         for (variable_bindings.items, self.nodes.items) |variables_for_node, node| {
-            var result = [_]u32{invalid_index} ** field_count;
+            var result: [field_count]u32 = @splat(invalid_index);
             for (variables_for_node, 0..) |variable, field_index| {
                 if (variable != invalid_index) result[field_index] = variable_groups[variable];
             }
