@@ -127,7 +127,7 @@ pub const Builder = struct {
         const one = try addVariable(self.allocator, &variables, 1, 1, 1);
         const two = try addVariable(self.allocator, &variables, 2, 2, 2);
         for (self.nodes.items) |node| {
-            var fields = [_]u32{invalid_index} ** field_count;
+            var fields: [field_count]u32 = @splat(invalid_index);
             fields[@intFromEnum(Semantics.Field.one)] = one;
             fields[@intFromEnum(Semantics.Field.two)] = two;
             fields[@intFromEnum(Semantics.Field.width)] = try addVariable(
